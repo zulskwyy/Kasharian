@@ -8,7 +8,7 @@
   const embedded = () => !!root.KH_EMBED;
   const MAX_BYTES = 12 * 1024 * 1024;
   // Gambar terlalu besar membuat OCR di HP berjam-jam; 2000 px sisi panjang cukup untuk struk.
-  const MAX_LONG = 2000, WORKER_INIT_MS = 60000, RECOGNIZE_MS = 90000, ALT_BUDGET_MS = 40000;
+  const MAX_LONG = 2000, WORKER_INIT_MS = 90000, RECOGNIZE_MS = 120000, ALT_BUDGET_MS = 40000;
   const fitScale = (long) => (long > MAX_LONG ? MAX_LONG / long : long < 1200 ? Math.min(2, 1500 / long) : 1);
   const withTimeout = (p, ms, msg) => new Promise((res, rej) => {
     const t = setTimeout(() => rej(Object.assign(new Error(msg), { timeout: true })), ms);

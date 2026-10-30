@@ -483,7 +483,10 @@
     const attempts = [{ ...a, words }];
     const needsReview = () => {
       const best = attempts.slice().sort((x, y) => receiptQuality(y) - receiptQuality(x))[0];
-      return !best || !best.amount || !best.sure || !((best.meta || {}).labTotal || []).length || (Number(res.confidence) > 0 && Number(res.confidence) < 72);
+      // Baca ulang hanya bila hasilnya memang belum meyakinkan (nominal kosong, belum pasti, atau tidak ada baris total).
+      // Keyakinan OCR yang rendah saja tidak cukup: foto struk dari HP hampir selalu di bawah 72%, dan setiap baca ulang
+      // adalah satu putaran OCR penuh yang lambat di HP.
+      return !best || !best.amount || !best.sure || !((best.meta || {}).labTotal || []).length;
     };
     if (needsReview() && res.retry && !overBudget(60000)) {
       try {
