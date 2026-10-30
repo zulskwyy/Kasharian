@@ -1,0 +1,298 @@
+/* KasHarian scan: logika pembaca struk dan riwayat transaksi dari hasil OCR (tanpa DOM, bisa dites di Node).
+   - Nominal struk dicocokkan secara hitungan: tunai - kembalian = total (bukan angka terbesar).
+   - Tanggal dibaca toleran terhadap salah baca OCR (O/0, l/1, spasi).
+   - Nama toko dicocokkan samar ke daftar jaringan toko (ALFAMIDT, NLFAMIDL tetap dikenali).
+   - Screenshot riwayat aplikasi (GoPay, OVO, Dana, dll): satu baris per transaksi, dengan tanggal dari judul hari. */
+(function (root, factory) {
+  const m = factory();
+  if (typeof module === 'object' && module.exports) module.exports = m; else root.KHScan = m;
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+  const pad = (n) => String(n).padStart(2, '0');
+  const iso = (y, m, d) => `${y}-${pad(m)}-${pad(d)}`;
+  const validDate = (y, m, d) => { const t = new Date(Date.UTC(y, m - 1, d)); return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d; };
+  const todayISO = () => { const t = new Date(); return iso(t.getFullYear(), t.getMonth() + 1, t.getDate()); };
+  const addDaysISO = (s, n) => { const [y, m, d] = s.split('-').map(Number), t = new Date(Date.UTC(y, m - 1, d + n)); return iso(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate()); };
+  const MON = { jan: 1, feb: 2, mar: 3, apr: 4, mei: 5, may: 5, jun: 6, jul: 7, agu: 8, agt: 8, aug: 8, sep: 9, okt: 10, oct: 10, nov: 11, des: 12, dec: 12 };
+
+  function lev(a, b) {
+    const m = a.length, n = b.length; if (!m) return n; if (!n) return m;
+    let prev = Array.from({ length: n + 1 }, (_, i) => i);
+    for (let i = 1; i <= m; i++) {
+      const cur = [i];
+      for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+    return prev[n];
+  }
+
+  // ---------- nama toko ----------
+  const B = (name, cat, keys, fuzzy) => ({ name, cat, keys, fuzzy: fuzzy !== false });
+  const BRANDS = [
+    B('Alfamidi', 'Belanja', ['alfamidi', 'midi utama']), B('Alfamart', 'Belanja', ['alfamart', 'sumber alfaria']), B('Indomaret', 'Belanja', ['indomaret', 'indomarco']),
+    B('Lawson', 'Belanja', ['lawson']), B('Circle K', 'Belanja', ['circle k'], false), B('Superindo', 'Belanja', ['superindo', 'supermarket indonesia']), B('Hypermart', 'Belanja', ['hypermart']),
+    B('Transmart', 'Belanja', ['transmart']), B('Carrefour', 'Belanja', ['carrefour']), B('Giant', 'Belanja', ['giant'], false), B('Ranch Market', 'Belanja', ['ranch market']), B('Ace Hardware', 'Belanja', ['ace hardware']),
+    B('Lazada', 'Belanja', ['lazada']), B('Tokopedia', 'Belanja', ['tokopedia']), B('Shopee', 'Belanja', ['shopee'], false),
+    B('KFC', 'Makan dan minum', ['kfc'], false), B('McDonald\'s', 'Makan dan minum', ['mcdonald']), B('Burger King', 'Makan dan minum', ['burger king']), B('Pizza Hut', 'Makan dan minum', ['pizza hut']),
+    B('Starbucks', 'Makan dan minum', ['starbucks']), B('Kopi Kenangan', 'Makan dan minum', ['kopi kenangan']), B('Janji Jiwa', 'Makan dan minum', ['janji jiwa']), B('Chatime', 'Makan dan minum', ['chatime']),
+    B('HokBen', 'Makan dan minum', ['hokben', 'hoka hoka']), B('Solaria', 'Makan dan minum', ['solaria']), B('Warung / restoran', 'Makan dan minum', ['warung', 'restoran', 'resto ', 'bakso', 'kebab'], false),
+    B('SPBU', 'Transportasi', ['spbu', 'pertamina', 'pertalite', 'pertamax']), B('Shell', 'Transportasi', ['shell'], false), B('Parkir', 'Transportasi', ['parkir', 'e-toll', 'tol '], false), B('Gojek', 'Transportasi', ['gojek'], false), B('Grab', 'Transportasi', ['grab'], false),
+    B('Apotek', 'Kesehatan', ['apotek', 'apotik', 'kimia farma', 'guardian', 'watsons', 'klinik']), B('Rumah sakit', 'Kesehatan', ['rumah sakit'], false),
+    B('PLN', 'Tagihan dan utilitas', ['pln'], false), B('PDAM', 'Tagihan dan utilitas', ['pdam'], false), B('Indihome', 'Tagihan dan utilitas', ['indihome']), B('Telkomsel', 'Tagihan dan utilitas', ['telkomsel']),
+    B('Smartfren', 'Tagihan dan utilitas', ['smartfren']), B('BPJS', 'Tagihan dan utilitas', ['bpjs'], false),
+    B('Donasi', 'Donasi dan sedekah', ['laznas', 'baznas zakat', 'infaq', 'zakat'], false)
+  ];
+  /** lines: array of strings. Mengembalikan {name, cat, line} atau null. Kecocokan pasti didahulukan, lalu samar (maks ~25% huruf salah). */
+  function detectBrand(texts) {
+    let best = null;
+    texts.forEach((t, li) => {
+      const low = ' ' + t.toLowerCase().replace(/[^a-z0-9\s'.-]/g, ' ').replace(/\s+/g, ' ') + ' ';
+      const toks = low.split(/[\s.\-']+/).filter((x) => x.length >= 4);
+      for (const b of BRANDS) {
+        for (const k of b.keys) {
+          let score = 0;
+          if (k.length <= 3 ? new RegExp('(^|[^a-z])' + k.trim() + '([^a-z]|$)').test(low) : low.includes(k.trim())) score = 3;
+          else if (b.fuzzy && !k.includes(' ') && k.length >= 7) {
+            for (const tk of toks) { if (Math.abs(tk.length - k.length) > 2) continue; const r = lev(tk, k) / k.length; if (r <= 0.26) score = Math.max(score, 2 - r); }
+          }
+          if (score && (!best || score > best.score || (score === best.score && li < best.li))) best = { score, li, name: b.name, cat: b.cat, line: t };
+        }
+      }
+    });
+    return best ? { name: best.name, cat: best.cat, line: best.line } : null;
+  }
+
+  // ---------- tanggal ----------
+  const fixDigits = (s) => s.replace(/[Oo]/g, '0').replace(/[Il|]/g, '1').replace(/S/g, '5');
+  function findDate(t, today, future) {
+    today = today || todayISO();
+    const ok = (y, m, d) => validDate(y, m, d) && (future || iso(y, m, d) <= addDaysISO(today, 1)) && y >= 2000;
+    let m = /(?<![\d\w])([\dOoIl|]{1,2})\s*[\/\-.]\s*([\dOoIl|]{1,2})\s*[\/\-.]\s*((?:20|2O)[\dOoIl|]{2}|[\dOoIl|]{2})(?![\d])/.exec(t);
+    if (m) { const d = +fixDigits(m[1]), mo = +fixDigits(m[2]); let ys = fixDigits(m[3]); const y = ys.length === 2 ? 2000 + +ys : +ys; if (ok(y, mo, d)) return iso(y, mo, d); }
+    m = /(?<!\d)(20\d{2})\s*[\/\-.]\s*(\d{1,2})\s*[\/\-.]\s*(\d{1,2})(?!\d)/.exec(t); if (m && ok(+m[1], +m[2], +m[3])) return iso(+m[1], +m[2], +m[3]);
+    m = /(?<!\d)(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?,?\s+(20\d{2})/.exec(t); if (m && MON[m[2].toLowerCase()] && ok(+m[3], MON[m[2].toLowerCase()], +m[1])) return iso(+m[3], MON[m[2].toLowerCase()], +m[1]);
+    return null;
+  }
+
+  // ---------- nominal ----------
+  const JUNK = /(telp|tel\.|npwp|wa\s*\/\s*sms|kritik|saran|www\.|\.com|\.co\.id|kav\.|jl\.|\bno\.|kasir|\bbon\b|member|poin|expired|point|nik\b|ref\b|trx|id\s*transaksi|versi|v\.\d|\b(tgl|tanggal|jam|waktu)\b|\d{1,2}:\d{2}|\d{1,2}\s*[-/]\s*\d{1,2}\s*[-/]\s*\d{2,4})/i;
+  // Final-payable labels used by Indonesian retail, bills, QRIS, and online checkout receipts.
+  // Deliberately accepts a bare `tagihan`/`jumlah` label because OCR often separates the amount onto the next line.
+  const RE_TOTAL = /(?:harga\s*jual|grand\s*total|total(?:\s*(?:(?:yang\s*)?(?:(?:harus|wajib)\s*)?(?:bayar|dibayar(?:kan)?|pembayaran|belanja|tagihan|akhir|bersih|harga|transaksi|keseluruhan|amount|due|payment)))?|totalbayar|jumlah(?:\s*(?:(?:yang\s*)?(?:(?:harus|wajib)\s*)?(?:dibayar(?:kan)?|bayar|pembayaran|tagihan|akhir|bersih|keseluruhan|transaksi)))?|(?:harus|wajib)\s*dibayar(?:kan)?|amount\s*due|balance\s*due|total\s*due|nominal\s*(?:(?:yang\s*)?(?:(?:harus|wajib)\s*)?)?(?:tagihan|pembayaran|dibayar(?:kan)?|bayar)|nilai\s*(?:akhir|transaksi|tagihan|pembayaran)|tagihan(?:\s*(?:anda|total|akhir|pembayaran))?|invoice\s*total|net\s*payable|payable\s*amount|^total\s*:?$)/i;
+  const RE_NOTTOTAL = /(?:total\s*(?:item|barang|qty)|item|qty|barang|diskon|hemat|ppn|dpp|pajak|sub\s*total|subtotal|poin|point)/i;
+  const AMT_RE = /(?<![\d.,A-Za-z])(\d{1,3}(?:[.,]\s?\d{3}){1,2}|\d{4,9}|\d{3})(?:[.,]\d{2})?(?![\dA-Za-z])/g;
+  const TOTAL_WORDS = ['total','jumlah','bayar','dibayar','dibayarkan','bersih','pembayaran','belanja','tagihan','akhir','harga','transaksi','keseluruhan','harus','wajib','grand','amount','due','payment','jual','anda','invoice','payable','nominal','nilai','net'];
+  function normalizeLabel(text) {
+    return String(text || '').toLowerCase().replace(/[|!]/g, 'i').split(/([^a-z0-9]+)/).map((part) => {
+      if (!/[a-z]/i.test(part)) return part;
+      let word = part.replace(/0/g, 'o').replace(/1/g, 'i').replace(/4/g, 'a').replace(/5/g, 's');
+      let best = word, distance = Infinity;
+      for (const target of TOTAL_WORDS) {
+        const d = lev(word, target);
+        const limit = target.length >= 8 ? 2 : 1;
+        if (d <= limit && d < distance) { best = target; distance = d; }
+      }
+      return best;
+    }).join('').replace(/totalbayar/g, 'total bayar').replace(/totalpembayaran/g, 'total pembayaran').replace(/jumlahtagihan/g, 'jumlah tagihan');
+  }
+  function amountsOf(text, allowBare) {
+    const t = fixNum(text), out = []; let m; AMT_RE.lastIndex = 0;
+    while ((m = AMT_RE.exec(t))) {
+      if (/^%/.test(t.slice(m.index + m[0].length).trim())) continue;
+      const raw = m[1].replace(/\s/g, ''); if (!/[.,]/.test(raw) && !allowBare) continue; let n = parseInt(raw.replace(/[.,]/g, ''), 10);
+      if (n >= 100 && n <= 50000000) out.push({ n, at: m.index });
+    }
+    return out;
+  }
+  const fixNum = (t) => String(t).replace(/(^|[^A-Za-z])([\dOoIl|]+(?:[.,]\s?[\dOoIl|]+)*)(?=$|[^A-Za-z])/g, (m, prefix, token) => prefix + token.replace(/[Oo]/g, '0').replace(/[Il|]/g, '1').replace(/\s+/g, ''));
+  const fuzzyHas = (text, key) => (text.toLowerCase().match(/[a-z]{4,}/g) || []).some((w) => lev(w, key) / key.length <= 0.4);
+  const labelOf = (text) => {
+    const label = String(text || '').replace(/\b(?:rp|idr)\b/ig, ' ').replace(/[\d.,\s]+$/g, '').trim(), l = normalizeLabel(label);
+    if (RE_TOTAL.test(l) && !RE_NOTTOTAL.test(l)) return 'total';
+    if (/(sub\s*total|subtotal)/.test(l)) return 'sub';
+    if (/(kembali|chang)/.test(l) || fuzzyHas(l, 'kembalian') || fuzzyHas(l, 'kembali')) return 'change';
+    if (/(tunai|cash|dibayar|qris|debit|kartu|gopay|ovo|\bdana\b|shopeepay|uang)/.test(l) || fuzzyHas(l, 'tunai')) return 'cash';
+    if (/(ppn|dpp|pajak|tax|diskon|hemat|potongan|service|servis)/.test(l)) return 'tax';
+    return '';
+  };
+  /** lines: [{text}] -> {amount, sure, choices:[n], how} */
+  function pickTotal(lines) { const r = pickTotal0(lines); return r; }
+  function pickTotal0(lines) {
+    const rows = lines.map((l, i) => ({ i, text: String(l.text || ''), am: JUNK.test(l.text) && !/total/i.test(l.text) ? [] : amountsOf(l.text, !!labelOf(l.text) && labelOf(l.text) !== 'tax'), lab: labelOf(l.text), neg: /\(\s*[\d.,\s]{3,}\s*\)?\s*$/.test(l.text) || /voucher|vc\s|diskon|potongan/i.test(l.text) && /\(/.test(l.text) }));
+    const withAm = rows.filter((r) => r.am.length);
+    const valueNearLabel = (r, key) => {
+      if (r.am.length) return r.am[r.am.length - 1].n;
+      let combined = r.text;
+      for (let j = r.i + 1; j < Math.min(rows.length, r.i + 4); j++) {
+        const next = rows[j];
+        if (next.lab && next.lab !== key) break;
+        if (next.lab === key && next.am.length) return next.am[next.am.length - 1].n;
+        const vals = amountsOf(next.text, true);
+        const bare = String(next.text).replace(/\b(?:rp|idr)\b/ig, '').trim();
+        if (vals.length && /^[\dOoIl|.,\s]+$/.test(bare)) return vals[vals.length - 1].n;
+        if (!vals.length && /[\p{L}]{2,}/u.test(next.text)) {
+          combined += ' ' + next.text;
+          if (labelOf(combined) === key) continue; // label split over multiple OCR lines (e.g. TOTAL / BAYAR)
+          if (RE_NOTTOTAL.test(normalizeLabel(combined))) break;
+          continue;
+        }
+        if (vals.length && labelOf(next.text) === key) return vals[vals.length - 1].n;
+        break;
+      }
+      return 0;
+    };
+    const byLab = (k) => rows.filter((r) => r.lab === k).map((r) => valueNearLabel(r, k)).filter((n) => n > 0);
+    const labTotal = byLab('total'), labCash = byLab('cash'), labChange = byLab('change');
+    // Include amounts found on a separate line after an explicit label in the candidate pool.
+    const pool = [...new Set([...withAm.flatMap((r) => r.am.map((x) => x.n)), ...labTotal, ...labCash, ...labChange])];
+    const choices = []; const add = (n) => { if (n && !choices.includes(n)) choices.push(n); }; const meta = { labTotal, labCash, labChange, pool };
+    // 1. hitungan: tunai - kembalian = total
+    let best = null;
+    for (const c of pool) for (const k of pool) {
+      if (k >= c) continue; const T = c - k; if (T < 500) continue;
+      const inPool = pool.includes(T); if (!inPool && !(labCash.includes(c) && labChange.includes(k))) continue;
+      const ix = (n) => pool.indexOf(n), ord = inPool && ix(T) < ix(c) && ix(c) < ix(k) ? 1.5 : 0;
+      const sc = (inPool ? 3 : 1.5) + ord + (labTotal.includes(T) ? 2 : 0) + (labCash.includes(c) ? 1 : 0) + (labChange.includes(k) ? 1 : 0);
+      if (!best || sc > best.sc || (sc === best.sc && c > best.c)) best = { sc, T, c, k };
+    }
+    if (best && best.sc >= 4) { add(best.T); labTotal.forEach(add); add(best.c); add(best.k); pool.forEach(add); return { amount: best.T, sure: true, how: 'hitungan tunai dan kembalian', choices: choices.slice(0, 6), meta }; }
+    // 1b. total berlabel tidak cocok dengan tunai - kembalian: salah satu salah baca. Pilih yang sesuai jumlah barang.
+    const items = rows.filter((r) => !r.lab && r.am.length >= 1 && (r.neg || (fixNum(r.text).match(/\p{L}/gu) || []).length >= 3)).reduce((a, r) => a + (r.neg ? -1 : 1) * r.am[r.am.length - 1].n, 0);
+    meta.items = items;
+    if (labTotal.length && labCash.length && labChange.length) {
+      const Tck = Math.max(...labCash) - labChange[0], Tl = labTotal[labTotal.length - 1];
+      if (Tck >= 500 && Tck !== Tl) {
+        const okC = (n) => !items || n >= items * 0.98, pickT = okC(Tl) && (!okC(Tck) || Math.abs(Tl - items) <= Math.abs(Tck - items)) ? Tl : Tck;
+        add(pickT); add(Tck); add(Tl); labCash.forEach(add); labChange.forEach(add);
+        return { amount: pickT, sure: false, how: 'total tidak cocok dengan tunai dan kembalian', choices: choices.slice(0, 6), meta };
+      }
+    }
+    // 1c. total = tunai (bayar pas), atau total = jumlah barang dikurangi voucher
+    const exact = labTotal.find((t) => labCash.includes(t));
+    if (exact) { add(exact); pool.forEach(add); return { amount: exact, sure: true, how: 'total sama dengan tunai', choices: choices.slice(0, 6), meta }; }
+    if (items >= 1000 && pool.includes(items)) { add(items); pool.forEach(add); return { amount: items, sure: true, how: 'jumlah barang', choices: choices.slice(0, 6), meta }; }
+    // 2. baris berlabel total
+    const maxCash = labCash.length ? Math.max(...labCash) : 0;
+    const okTotals = labTotal.filter((n) => !maxCash || n <= maxCash);
+    if (okTotals.length) { const T = okTotals[okTotals.length - 1]; add(T); if (best) add(best.T); pool.forEach(add); return { amount: T, sure: items > 0 && Math.abs(items - T) <= 100 ? true : !labCash.length || labCash.some((c) => c >= T), how: 'baris total', choices: choices.slice(0, 6), meta }; }
+    if (best) { add(best.T); pool.forEach(add); return { amount: best.T, sure: false, how: 'hitungan', choices: choices.slice(0, 6), meta }; }
+    // 3. cadangan: angka terbesar yang bukan tunai/kembalian/pajak
+    const skip = new Set([...labCash, ...labChange, ...rows.filter((r) => r.lab === 'tax').flatMap((r) => r.am.map((x) => x.n))]);
+    const cand = pool.filter((n) => !skip.has(n)); const round = (n) => n >= 10000 && n % 10000 === 0; cand.sort((a, b) => (round(a) - round(b)) || b - a); cand.forEach(add); pool.forEach(add);
+    return { amount: cand[0] || 0, sure: false, how: 'angka terbesar', choices: choices.slice(0, 6), meta };
+  }
+
+  const STOP = /(struk|nota|invoice|receipt|kasir|tagihan|terima kasih|selamat datang|jl\.|jalan|telp|npwp)/i;
+  function headMerchant(texts) {
+    const clean = (x) => !(x.split(/\s+/).some((w) => w.length >= 4 && /[a-z]/.test(w) && /[A-Z]/.test(w) && !/^[A-Z][a-z]+$/.test(w)));
+    const t = texts.slice(0, 6).find((x) => (x.match(/\p{L}/gu) || []).length >= 4 && (x.match(/\d/g) || []).length <= 3 && !STOP.test(x) && clean(x));
+    return t ? t.replace(/[^\p{L}\p{N}\s.&'-]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 40) : '';
+  }
+  /** Struk/tagihan -> {amount, sure, choices, merchant, brand, category, date, due, isBill} */
+  function analyzeReceipt(lines, today) {
+    const texts = lines.map((l) => l.text), all = texts.join('\n');
+    const tot = pickTotal(lines);
+    const dueLine = texts.find((t) => /(jatuh\s*tempo|batas\s*(waktu\s*)?bayar|due\s*date|bayar\s*sebelum)/i.test(t)), due = dueLine ? findDate(dueLine, today, true) : null;
+    let date = null; for (const t of texts) { const d = findDate(t, today); if (d && d !== due) { date = d; break; } }
+    const brand = detectBrand(texts);
+    const merchant = brand ? brand.name : headMerchant(texts) || null;
+    return { ...tot, merchant, brand: brand ? brand.name : null, brandCat: brand ? brand.cat : null, date, due, isBill: /(tagihan|jatuh\s*tempo|invoice|rekening\s*(listrik|air)|pelanggan)/i.test(all) };
+  }
+
+  // ---------- screenshot riwayat aplikasi ----------
+  function groupLines(words) {
+    const ws = words.filter((w) => w.text && w.text.trim()).map((w) => ({ ...w, text: w.text.trim(), yc: (w.y0 + w.y1) / 2 }));
+    if (!ws.length) return { lines: [], medH: 10, maxX: 0 };
+    const hs = ws.map((w) => w.y1 - w.y0).sort((a, b) => a - b), medH = Math.max(4, hs[Math.floor(hs.length / 2)]);
+    ws.sort((a, b) => a.yc - b.yc); const lines = [];
+    for (const w of ws) { const l = lines[lines.length - 1]; if (l && Math.abs(w.yc - l.yc) <= medH * 0.55) { l.ws.push(w); l.yc = (l.yc * (l.ws.length - 1) + w.yc) / l.ws.length; } else lines.push({ ws: [w], yc: w.yc }); }
+    lines.forEach((l) => { l.ws.sort((a, b) => a.x0 - b.x0); l.text = l.ws.map((w) => w.text).join(' '); });
+    return { lines, medH, maxX: Math.max(...ws.map((w) => w.x1)) };
+  }
+  const DAYS = '(?:senin|selasa|rabu|kamis|jumat|jum\'at|sabtu|minggu)';
+  const HDR_FULL = new RegExp('(?:' + DAYS + '|hari ini|kemarin)?\\s*(\\d{1,2})\\s+(jan|feb|mar|apr|mei|jun|jul|agu|agt|sep|okt|nov|des)[a-z]*\\.?\\s*,?\\s*(20\\d{2})', 'i');
+  const HDR_SHORT = new RegExp('^(?:' + DAYS + '|hari ini|kemarin)[\\s,]*(\\d{1,2})\\s+(jan|feb|mar|apr|mei|jun|jul|agu|agt|sep|okt|nov|des)[a-z]*\\.?$', 'i');
+  const NAV = /^(beranda|keuangan|qris|riwayat|profil|tanggal|layanan|metode|download|kembali|home|transaksi|semua|filter)(\s|$)/i;
+  const RP_RE = /([-\u2212\u2013\u2014+])?\s*Rp\.?\s*(\d{1,3}(?:[.,]\d{3})+|\d+)(?![\d])/i;
+  const SUBLINE = /^(bni|bri|bca|mandiri|bsi|bank|gopay|cimb|permata|dana|ovo|\*+)\b.*(\d{4,}|\*{2,})/i;
+  const WD = { senin: 1, selasa: 2, rabu: 3, kamis: 4, jumat: 5, sabtu: 6, minggu: 0 };
+  const dow = (iso0) => { const [y, m, d] = iso0.split('-').map(Number); return new Date(Date.UTC(y, m - 1, d)).getUTCDay(); };
+  /** Judul hari ("Selasa 13 Okt 2026", "Kemarin") -> tanggal ISO. Hari dan urutan (terbaru di atas) dipakai untuk membetulkan salah baca angka. */
+  function headerOf(l, txt, prev, today) {
+    if (l.ws.length > 7 || RP_RE.test(txt)) return null;
+    const first = (l.ws[0].text || '').toLowerCase().replace(/[^a-z]/g, '');
+    if (/^(kemarin|kemar[il]n)$/.test(first) || (first === 'kemarin')) return addDaysISO(today, -1);
+    if (/^hari$/.test(first) && /ini/i.test(txt)) return today;
+    let wd = null; for (const [k, v] of Object.entries(WD)) if (first === k || (k.length >= 5 && first.length >= 4 && lev(first, k) <= 1)) wd = v;
+    const mon = /(jan|feb|mar|apr|mei|jun|jul|agu|agt|sep|okt|oxt|nov|des)[a-z]*/i.exec(txt), yr = /(20\d{2})/.exec(txt);
+    if (wd == null && !(mon && /^\d{1,2}\s/.test(txt))) return null;
+    if (wd == null) { const m = /^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?,?\s+(20\d{2})/.exec(txt); if (m && MON[m[2].toLowerCase()] && validDate(+m[3], MON[m[2].toLowerCase()], +m[1])) return iso(+m[3], MON[m[2].toLowerCase()], +m[1]); return null; }
+    const dn = (/(?:^|\s)(\d{1,2})(?=\s|$)/.exec(txt.replace(/^\S+\s*/, '')) || [])[1];
+    const mo = mon ? (MON[mon[1].toLowerCase().replace('oxt', 'okt')] || null) : null, upper = prev ? addDaysISO(prev, -1) : today;
+    const Y = yr ? +yr[1] : +upper.slice(0, 4), M = mo || +upper.slice(5, 7);
+    if (dn && validDate(Y, M, +dn) && dow(iso(Y, M, +dn)) === wd && iso(Y, M, +dn) <= upper) return iso(Y, M, +dn);
+    // cari tanggal terdekat sebelum 'upper' dengan hari yang sama (bulan sama bila terbaca)
+    let best = null; for (let i = 0; i < 70; i++) { const d = addDaysISO(upper, -i); if (dow(d) !== wd) continue; if (mo && +d.slice(5, 7) !== mo) continue; const sc = (dn ? lev(String(+d.slice(8)), String(+dn)) : 0) * 100 + i; if (!best || sc < best.sc) best = { sc, d }; if (!dn) break; }
+    return best ? best.d : null;
+  }
+  /** "Rp2.55jt" / "Rp4jt" / "Rp62.500" -> {n, tol}. Angka berakhiran jt/rb dibulatkan aplikasi, jadi diberi toleransi setengah digit terakhir. */
+  function shortRp(s) {
+    const m = /Rp\.?\s*(\d+(?:[.,]\d+)*)\s*(jt|juta|rb|ribu)?/i.exec(s || ''); if (!m) return null;
+    if (m[2]) { const mult = /^j/i.test(m[2]) ? 1e6 : 1e3, num = m[1].replace(',', '.'), dec = (num.split('.')[1] || '').length; return { n: Math.round(parseFloat(num) * mult), tol: Math.round(0.5 * Math.pow(10, -dec) * mult) }; }
+    return { n: parseInt(m[1].replace(/[.,]/g, ''), 10), tol: 0 };
+  }
+  /** Baris ringkasan bulan di atas riwayat ("Pengeluaran: -Rp2.55jt  Pemasukan: Rp4jt"). */
+  function headerSums(txt) {
+    const o = /pengeluaran\s*:?\s*(.*?)(?=pemasukan|$)/i.exec(txt), i = /pemasukan\s*:?\s*(.*?)(?=pengeluaran|$)/i.exec(txt);
+    return { out: o ? shortRp(o[1]) : null, in: i ? shortRp(i[1]) : null };
+  }
+  function parseAppList(words, today) {
+    today = today || todayISO();
+    words = words.flatMap((w) => { const t = (w.text || '').trim(), m = /^(.{2,}?)([-\u2212\u2013+]?R[pP]\.?\d[\d.,]*)$/.exec(t); if (!m) return [w]; const f = m[1].length / t.length, cx = w.x0 + (w.x1 - w.x0) * f; return [{ ...w, text: m[1], x1: cx }, { ...w, text: m[2], x0: cx }]; });
+    const { lines, medH, maxX } = groupLines(words);
+    if (lines.length < 4) return null;
+    const rpx = words.filter((w) => /^[-\u2212\u2013\u2014+]?Rp\.?\d/i.test(w.text.trim())).map((w) => w.x0).sort((a, b) => a - b);
+    const cut = rpx.length >= 2 ? Math.min(rpx[Math.floor(rpx.length * 0.1)], maxX * 0.75) - medH * 0.5 : maxX * 0.5; let date = null; const groups = new Set();
+    const heads = [], anchors = [], frags = [], sums = { out: null, in: null };
+    for (const l of lines) {
+      const txt = l.text.replace(/\s+/g, ' ');
+      if (/(pengeluaran|pemasukan)\s*:/i.test(txt)) { const hs = headerSums(txt); if (hs.out) sums.out = hs.out; if (hs.in) sums.in = hs.in; continue; }
+      const hd = headerOf(l, txt, heads.length ? heads[heads.length - 1].date : null, today);
+      if (hd) { heads.push({ yc: l.yc, date: hd }); groups.add(hd); continue; }
+      const right = l.ws.filter((w) => w.x0 >= cut), left = l.ws.filter((w) => w.x0 < cut);
+      const rt = right.map((w) => w.text).join(' ').replace(/\s*([.,])\s*/g, '$1'), rm = RP_RE.exec(rt);
+      if (rm) {
+        const hasHead = heads.length; if (!hasHead) continue;
+        anchors.push({ yc: l.yc, neg: !!(rm[1] && rm[1] !== '+'), plus: rm[1] === '+', n: parseInt(rm[2].replace(/[.,]/g, ''), 10), date: heads[heads.length - 1].date, h: heads.length });
+      }
+      const lt = left.map((w) => w.text).join(' ').replace(/\s+/g, ' ').trim(), rtOnly = !rm ? right.map((w) => w.text).join(' ') : '';
+      if (lt && heads.length) frags.push({ yc: l.yc, text: lt, h: heads.length, method: '' });
+      if (!rm && rtOnly && /(saldo|coins?|poin|gopay|ovo|dana|shopeepay)/i.test(rtOnly) && frags.length === 0) { /* abaikan */ }
+    }
+    if (anchors.length < 2 || !heads.length) return null;
+    const docMinus = anchors.filter((a) => a.neg).length >= 2;
+    const used = new Map(); anchors.forEach((a) => used.set(a, []));
+    for (const f of frags) {
+      if (NAV.test(f.text) || /^(cashback|coins?\s+dari)/i.test(f.text) || /^(gopay\s+)?(saldo|coins?|poin)\b/i.test(f.text) || /^\d{1,3}$/.test(f.text)) continue;
+      let best = null; for (const a of anchors) { if (a.h !== f.h) continue; const d = Math.abs(a.yc - f.yc); if (d <= medH * 3.2 && (!best || d < best.d)) best = { a, d }; }
+      if (best) used.get(best.a).push(f);
+    }
+    const seen = {}, rows = [];
+    anchors.forEach((a) => {
+      const fr = used.get(a).sort((p, q) => p.yc - q.yc), main = fr.filter((f) => !SUBLINE.test(f.text)), sub = fr.filter((f) => SUBLINE.test(f.text));
+      const desc = main.map((f) => f.text).join(' ').replace(/\s+/g, ' ').trim();
+      const pos = /(top\s*-?up|isi\s*saldo|diterima|terima\s+dari|refund|pengembalian|gaji|masuk)/i.test(desc);
+      const neg = a.neg || (!a.plus && (docMinus ? !pos : !pos && /(bayar|ditransfer|transfer ke|tarik|beli|pembayaran|tagihan)/i.test(desc)));
+      const key = a.date + '|' + desc.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24) + '|' + a.n; seen[key] = (seen[key] || 0) + 1;
+      rows.push({ date: a.date, time: '', desc: desc || 'Transaksi', sub: sub.map((f) => f.text).join(' '), txId: 'layar:' + key + '#' + seen[key], method: '', neg, rp: true, amt: a.n, noDesc: !desc, hint: desc ? '' : 'Keterangan tidak terbaca; baris mungkin terpotong di tepi tangkapan layar. Periksa jenis dan nominalnya.' });
+    });
+    const all = words.map((w) => w.text).join(' ');
+    const provider = /gopay/i.test(all) ? 'GoPay' : /\bovo\b/i.test(all) ? 'OVO' : /shopeepay/i.test(all) ? 'ShopeePay' : /\bdana\b/i.test(all) ? 'Dana' : null;
+    // nama tujuan yang berulang: kemungkinan rekening sendiri
+    const names = {}; rows.forEach((r) => { const m = /(?:ditransfer|transfer|kirim)\s+ke\s+(.+)/i.exec(r.desc); if (m) { const k = m[1].toLowerCase(); names[k] = (names[k] || 0) + 1; } });
+    rows.forEach((r) => { const m = /(?:ditransfer|transfer|kirim)\s+ke\s+(.+)/i.exec(r.desc); if (m && names[m[1].toLowerCase()] >= 3) r.hint = `Nama ini muncul ${names[m[1].toLowerCase()]} kali. Jika ini rekening Anda sendiri, pilih "Pindah dana".`; });
+    return { rows, header: { in: sums.in ? sums.in.n : null, out: sums.out ? sums.out.n : null, tolIn: sums.in ? sums.in.tol : 0, tolOut: sums.out ? sums.out.tol : 0, coinsUsed: null }, owner: '', provider, source: 'layar' };
+  }
+
+  return { shortRp, headerSums, lev, detectBrand, findDate, amountsOf, pickTotal, analyzeReceipt, parseAppList, groupLines, BRANDS };
+});
