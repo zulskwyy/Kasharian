@@ -1,2 +1,0 @@
-# Kasharian
-Manage your money
