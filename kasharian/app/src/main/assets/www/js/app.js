@@ -608,7 +608,16 @@
       h('div', { class: 'fund-list' }, fundRow('Tabungan terencana', budgetState ? budgetState.savingsProgress : 0), fundRow('Dompet tabungan', physicalSavings),
         cashWallets.length ? fundRow('Uang tunai', cashOnHand) : h('button', { class: 'fund-row fund-add', onclick: () => { db().wallets.push({ id: S.uid(), name: 'Tunai', type: 'CASH', openingBalance: 0, includeInTotal: true, archived: false, createdAt: Date.now() }); S.save(); render(); } }, h('span', null, 'Uang tunai'), h('strong', null, 'Tambah'))));
     const exhausted = budgetState && budgetState.spendable <= 0;
+    // Ajakan sekali di awal: tidak memaksa pindah layar, bisa ditunda dengan "Nanti".
+    const needsPlan = window.KHExtra && typeof KHExtra.plan === 'function' && !KHExtra.plan().chosen && !db().planNudgeDismissed;
+    const planNudge = needsPlan ? h('section', { class: 'card plan-nudge' },
+      h('strong', null, 'Atur rencana uang dulu'),
+      h('p', null, 'Pilih pembagian uang supaya setiap pemasukan langsung terbagi untuk kebutuhan, keinginan, dan tabungan.'),
+      h('div', { class: 'btn-row' },
+        h('button', { class: 'btn primary', onclick: () => go('plan', { from: 'home' }) }, 'Atur sekarang'),
+        h('button', { class: 'btn ghost', onclick: () => { db().planNudgeDismissed = true; S.save(); render(); } }, 'Nanti'))) : null;
     return frame({ title: 'KasHarian', tabs: 'home', left: themeButton(), right: h('button', { class: 'avatar-btn', 'aria-label': 'Profil', onclick: () => go('profile') }, avatarEl(p, 36)), children: [
+      planNudge,
       h('section', { class: 'card hero home-budget-hero' },
         h('small', { class: 'hero-kicker' }, budgetState ? 'SISA LIMIT BELANJA' : 'UANG ANDA SEKARANG'), bal,
         h('div', { class: 'hero-pills' }, h('span', { class: 'pill' }, h('small', null, one ? one.name : 'Saldo'), h('strong', null, R.rupiah(one ? (ledger[one.id] || 0) : totalBalance()))),
@@ -675,6 +684,8 @@
     const drawPreview = () => {
       const status = h('p', { class: 'error', role: 'alert', hidden: true });
       const fieldNames = { amount: 'Nominal', category: 'Kategori', wallet: 'Dompet asal', 'wallet-pair': 'Dompet tujuan', date: 'Tanggal', direction: 'Jenis transaksi' };
+      // R.validDate menerima (tahun, bulan, hari), bukan teks YYYY-MM-DD.
+      const validIsoDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || '')) && ((p) => R.validDate(p.y, p.m, p.d))(R.parts(String(s)));
       const firstIssue = () => {
         for (let i = 0; i < entries.length; i++) {
           const e = entries[i];
@@ -683,7 +694,7 @@
           if (e.kind !== 'TRANSFER' && (e.category === 'Belum pasti' || !catList(e.kind).includes(e.category))) return { index: i, field: 'category' };
           if (!activeWallets().some((w) => w.id === e.walletId)) return { index: i, field: 'wallet' };
           if (e.kind === 'TRANSFER' && (!activeWallets().some((w) => w.id === e.toWalletId) || e.toWalletId === e.walletId)) return { index: i, field: 'wallet-pair' };
-          if (!R.validDate(e.date)) return { index: i, field: 'date' };
+          if (!validIsoDate(e.date)) return { index: i, field: 'date' };
         }
         return null;
       };

@@ -7,6 +7,13 @@
   const abs = (p) => new URL(p, document.baseURI).href;
   const embedded = () => !!root.KH_EMBED;
   const MAX_BYTES = 12 * 1024 * 1024;
+  // Gambar terlalu besar membuat OCR di HP berjam-jam; 2000 px sisi panjang cukup untuk struk.
+  const MAX_LONG = 2000, WORKER_INIT_MS = 60000, RECOGNIZE_MS = 90000, ALT_BUDGET_MS = 40000;
+  const fitScale = (long) => (long > MAX_LONG ? MAX_LONG / long : long < 1200 ? Math.min(2, 1500 / long) : 1);
+  const withTimeout = (p, ms, msg) => new Promise((res, rej) => {
+    const t = setTimeout(() => rej(Object.assign(new Error(msg), { timeout: true })), ms);
+    p.then((v) => { clearTimeout(t); res(v); }, (e) => { clearTimeout(t); rej(e); });
+  });
 
   const loaded = {};
   function loadScript(src) {
@@ -48,7 +55,7 @@
         } else {
           await loadScript(abs('vendor/tesseract/tesseract.min.js'));
           const langs = 'ind+eng';
-          worker = await root.Tesseract.createWorker(langs, 1, { workerPath: abs('vendor/tesseract/worker.min.js'), corePath: abs('vendor/tesseract/'), langPath: abs('vendor/tessdata/'), gzip: true, workerBlobURL: false, logger });
+          worker = await withTimeout(root.Tesseract.createWorker(langs, 1, { workerPath: abs('vendor/tesseract/worker.min.js'), corePath: abs('vendor/tesseract/'), langPath: abs('vendor/tessdata/'), gzip: true, workerBlobURL: false, cacheMethod: 'none', logger }), WORKER_INIT_MS, 'Mesin baca terlalu lama dimulai. Tutup aplikasi lalu coba lagi.');
         }
         return worker;
       })().catch((e) => { workerPromise = null; throw new Error(e && e.message ? e.message : 'Mesin baca gagal dimulai.'); });
@@ -110,12 +117,12 @@
   }
   function preprocess(src) {
     const w0 = src.width, h0 = src.height, long = Math.max(w0, h0);
-    let scale = 1;
-    if (long > 2600) scale = 2600 / long; else if (long < 1500) scale = Math.min(2.5, 1900 / long);
+    const scale = fitScale(long);
     return prep(src, 0, 0, w0, h0, scale, isDark(src));
   }
   /** Foto struk: satu kali baca. Screenshot panjang (riwayat transaksi): dipotong per bagian dengan tumpang tindih, ukuran teks dijaga. */
   async function ocrImage(src, name, type, onStage) {
+    const t0 = Date.now();
     const W = src.width, H = src.height, pixels = W * H, dark = isDark(src), tall = H / W > 2.2 && H > 2000;
     // PNG is common for screenshots, but file type/name alone must never make an image un-retryable.
     const shot = dark || /screenshot|screen[_ -]?shot|tangkapan|capture/i.test(name || '');
@@ -123,7 +130,7 @@
     // Prefer block mode for ordinary receipts; dark/UI screenshots use sparse-text mode and can retry the other mode.
     const mode = shot ? '11' : '6';
     if (!tall) {
-      const long = Math.max(W, H), scale = long > 2600 ? 2600 / long : long < 1500 ? Math.min(2.5, 1900 / long) : 1;
+      const long = Math.max(W, H), scale = fitScale(long);
       onStage && onStage(shot ? 'Menyiapkan screenshot struk' : 'Meningkatkan keterbacaan gambar');
       const pre = prep(src, 0, 0, W, H, scale, dark);
       const r = await ocrCanvas(pre.canvas, 0, mode);
@@ -135,12 +142,11 @@
         alts: pixels <= 4_500_000 && Math.max(W, H) <= 4200 ? async (onS) => {
           const out = [], configs = [
             [1.45, false, shot ? '11' : '6'],
-            [1.8, true, '6'],
-            [1.35, false, '11'],
-            [1.6, true, '11']
+            [1.8, true, '6']
           ];
           let k = 0;
           for (const [sc, bin, m] of configs) {
+            if (Date.now() - t0 > ALT_BUDGET_MS) break;
             onS && onS(`Membaca ulang dengan pengaturan lain (${++k} dari ${configs.length})`);
             try {
               const cap = Math.sqrt((bin ? 1_650_000 : 3_000_000) / pixels);
@@ -202,7 +208,7 @@
     const w = await getWorker();
     mode = mode || '6';                                  // 6 = blok seragam (struk), 11 = teks tersebar (screenshot aplikasi)
     if (curMode !== mode) { try { await w.setParameters({ tessedit_pageseg_mode: mode, preserve_interword_spaces: '1' }); curMode = mode; } catch (e) { /* pakai bawaan */ } }
-    const { data } = await w.recognize(canvas, {}, { text: true, blocks: true });
+    const { data } = await withTimeout(w.recognize(canvas, {}, { text: true, blocks: true }), RECOGNIZE_MS, 'Pembacaan terlalu lama. Coba foto yang lebih dekat dan terang.');
     return data;
   }
   async function ocrCanvas(canvas, yOffset, mode) {
@@ -216,7 +222,7 @@
         const trial = await recognizeOnce(trialScale < 1 ? shrink(canvas, trialScale) : canvas, trialMode);
         if (wordsFromOcr(trial).length) { data = trial; scale = trialScale; }
         else { err = new Error('Belum ada teks yang terbaca pada percobaan ini'); await resetWorker(); }
-      } catch (e) { err = e; await resetWorker(); } // buat ulang worker setelah error atau hasil kosong
+      } catch (e) { err = e; await resetWorker(); if (e && e.timeout) break; } // buat ulang worker setelah error; jangan ulang bila sudah kehabisan waktu
     }
     if (!data) throw new Error('Teks belum berhasil dibaca' + (err && err.message ? ` (${err.message})` : '') + '. Gambar masih dapat disimpan, atau coba JPG/PNG yang lebih jelas.');
     return { words: wordsFromOcr(data).map((x) => ({ ...x, x0: x.x0 / scale, x1: x.x1 / scale, y0: x.y0 / scale + yOffset, y1: x.y1 / scale + yOffset })), confidence: Number(data.confidence) || 0 };

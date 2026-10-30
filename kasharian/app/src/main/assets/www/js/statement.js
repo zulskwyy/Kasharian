@@ -407,7 +407,7 @@
         card(h('h3', null, 'Periode'), chips, customBox, field('Dompet', wallet)),
         card(h('h3', null, 'Ringkasan'), preview),
         card(h('div', { class: 'stack' }, pdfBtn, excelBtn), err,
-          h('p', { class: 'about-note' }, 'Dokumen dibuat di perangkat ini dengan logo KasHarian. Tidak ada data yang dikirim ke mana pun. Ini ringkasan catatanmu, bukan dokumen resmi bank.'))] });
+          h('button', { class: 'link', type: 'button', onclick: () => KHUI.notice('Tentang dokumen ini', h('div', { class: 'info-body' }, h('p', null, 'Dokumen dibuat di perangkat ini dengan logo KasHarian. Tidak ada data yang dikirim ke mana pun.'), h('p', null, 'Ini ringkasan catatanmu, bukan dokumen resmi bank.')), 'info') }, 'Info dokumen'))] });
     };
   }
 

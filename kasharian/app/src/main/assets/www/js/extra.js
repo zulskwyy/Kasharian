@@ -463,10 +463,11 @@
     return score;
   }
   async function readDoc(files, onStage) {
+    const t0 = Date.now(), overBudget = (ms) => Date.now() - t0 > ms;
     const res = await KHOCR.readFiles(files, onStage);
     let words = res.words || [];
     // Sparse or genuinely low-confidence OCR gets a second segmentation pass before classification.
-    if (res.retry && (words.length < 5 || (Number(res.confidence) > 0 && Number(res.confidence) < 48))) {
+    if (res.retry && !overBudget(60000) && (words.length < 5 || (Number(res.confidence) > 0 && Number(res.confidence) < 48))) {
       try {
         onStage && onStage('Hasil awal kurang terbaca; mencoba mode pembacaan lain');
         const again = await res.retry(onStage);
@@ -484,14 +485,14 @@
       const best = attempts.slice().sort((x, y) => receiptQuality(y) - receiptQuality(x))[0];
       return !best || !best.amount || !best.sure || !((best.meta || {}).labTotal || []).length || (Number(res.confidence) > 0 && Number(res.confidence) < 72);
     };
-    if (needsReview() && res.retry) {
+    if (needsReview() && res.retry && !overBudget(60000)) {
       try {
         onStage && onStage('Memeriksa ulang label total dan nominal');
         const w2 = await res.retry(onStage);
         if (w2 && w2.length) attempts.push({ ...analyzeLines(KHSlip.linesFromWords(w2)), words: w2 });
       } catch (e) { /* keep all earlier useful reads */ }
     }
-    if (needsReview() && res.alts) {
+    if (needsReview() && res.alts && !overBudget(50000)) {
       try {
         const alts = await res.alts(onStage);
         (alts || []).forEach((w) => { if (w && w.length) attempts.push({ ...analyzeLines(KHSlip.linesFromWords(w)), words: w }); });

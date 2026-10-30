@@ -16,13 +16,13 @@
         item('Dompet', null, () => go('wallets')),
         item('Rencana uang', null, () => go('plan')),
         item('Rapikan data', null, () => go('rapikan')),
-        window.KHStatement ? item('E-Statement', 'Unduh PDF atau Excel', () => go('estatement')) : null,
+        window.KHStatement ? item('E-Statement', null, () => go('estatement')) : null,
         item('Ringkasan bulan', null, () => go('summary')),
         item('Notifikasi pengingat', null, () => go('notif')),
         item('Kamus saya', null, () => go('memory')),
         item('Cadangan', backupDays() >= 7 ? (db().lastBackupAt ? 'Terakhir ' + backupDays() + ' hari lalu' : 'Belum pernah dicadangkan') : null, () => go('backup')),
         item('Keamanan', null, () => go('security')),
-        item('Tentang', 'Versi ' + A.VERSION, () => go('about')))),
+        item('Tentang', null, () => go('about')))),
       h('button', { class: 'btn block', onclick: A.lockNow }, 'Kunci sekarang'),
       h('button', { class: 'btn danger block', onclick: () => go('delete') }, 'Hapus semua data')] });
   };
@@ -185,7 +185,7 @@
     const privacy = () => {
       const notes = [
         'Semua data tersimpan di perangkat ini. Tanpa akun, server, iklan, atau analitik.',
-        'Aplikasi tidak mengirim data keuanganmu ke mana pun.',
+        'Aplikasi tidak mengirim data keuanganmu ke mana pun. Membuka tautan kontak memakai internet, tetapi data keuanganmu tidak ikut terkirim.',
         window.KHNativeStorage ? 'Data keuangan disimpan dalam basis data SQLCipher terenkripsi. Kunci acak dilindungi Android Keystore; PIN mengunci akses aplikasi.' : 'Data di peramban belum dienkripsi saat disimpan. PIN mengunci tampilan, bukan mengenkripsi data.',
         'Lupa PIN? Pakai 12 kata pemulihan (Lainnya > Keamanan) atau cadangan terenkripsi dari menu Cadangan.'
       ];
@@ -207,9 +207,9 @@
           row('mailto:' + MAKER.email + '?subject=' + encodeURIComponent('KasHarian: kritik, saran, atau order'), 'Email', MAKER.email),
           row('https://www.instagram.com/' + MAKER.ig, 'Instagram', '@' + MAKER.ig),
           row('https://www.linkedin.com/in/' + MAKER.linkedin, 'LinkedIn', MAKER.name)),
-        h('p', { class: 'about-note' }, 'Membuka tautan di atas memakai internet. Data keuanganmu tidak ikut terkirim.')),
+        null),
       card(h('button', { class: 'btn block', onclick: privacy }, 'Privasi')),
-      h('p', { class: 'about-foot' }, '© 2026 ' + MAKER.name)] });
+      null] });
   };
 
   // ----- profile -----

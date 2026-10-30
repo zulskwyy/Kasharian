@@ -3,6 +3,7 @@ package id.kasharian.app;
 import android.Manifest;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.content.ClipData;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -10,6 +11,7 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.MediaStore;
 import android.util.Base64;
 import android.view.View;
 import android.view.Window;
@@ -31,6 +33,7 @@ import androidx.biometric.BiometricPrompt;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.ContextCompat;
+import androidx.core.content.FileProvider;
 import androidx.fragment.app.FragmentActivity;
 import androidx.webkit.WebViewAssetLoader;
 
@@ -60,11 +63,14 @@ public final class MainActivity extends FragmentActivity {
     private static final int REQ_OPEN_FILE = 4101;
     private static final int REQ_CREATE_FILE = 4102;
     private static final int REQ_POST_NOTIFICATIONS = 4103;
+    private static final int REQ_CAPTURE = 4104;
     private static final String APP_ASSET_HOST = "appassets.androidplatform.net";
     private static final String NOTIFICATION_CHANNEL = "kasharian-local-reminders";
 
     private WebView webView;
     private ValueCallback<Uri[]> pendingFileCallback;
+    private Uri pendingCaptureUri;
+    private File pendingCaptureFile;
     private byte[] pendingSaveBytes;
     private String pendingSaveName;
     private String pendingSaveMime;
@@ -137,9 +143,18 @@ public final class MainActivity extends FragmentActivity {
             public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> filePathCallback, FileChooserParams params) {
                 if (pendingFileCallback != null) pendingFileCallback.onReceiveValue(null);
                 pendingFileCallback = filePathCallback;
+                String[] accept = params.getAcceptTypes();
+                boolean imagesOnly = accept != null && accept.length > 0;
+                if (accept != null) {
+                    for (String type : accept) {
+                        if (type != null && !type.trim().isEmpty() && !type.trim().startsWith("image/")) imagesOnly = false;
+                    }
+                }
+                // <input capture> berarti "ambil foto": buka aplikasi kamera, bukan pemilih berkas.
+                if (params.isCaptureEnabled() && imagesOnly && launchCamera()) return true;
                 Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
                 intent.addCategory(Intent.CATEGORY_OPENABLE);
-                intent.setType("*/*");
+                intent.setType(imagesOnly ? "image/*" : "*/*");
                 intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE);
                 try {
                     startActivityForResult(intent, REQ_OPEN_FILE);
@@ -155,6 +170,35 @@ public final class MainActivity extends FragmentActivity {
 
         setContentView(new FrameLayout(this) {{ addView(webView, new FrameLayout.LayoutParams(-1, -1)); }});
         webView.loadUrl("https://" + APP_ASSET_HOST + "/assets/www/index.html");
+    }
+
+    /** Membuka kamera bawaan HP. Tidak perlu izin CAMERA; foto disimpan sementara di cache aplikasi. */
+    private boolean launchCamera() {
+        try {
+            File dir = new File(getCacheDir(), "captures");
+            if (!dir.exists() && !dir.mkdirs()) return false;
+            File[] old = dir.listFiles();
+            if (old != null) {
+                for (File f : old) {
+                    if (System.currentTimeMillis() - f.lastModified() > 3600000L) f.delete();
+                }
+            }
+            File photo = File.createTempFile("struk_", ".jpg", dir);
+            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", photo);
+            Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+            intent.putExtra(MediaStore.EXTRA_OUTPUT, uri);
+            intent.setClipData(ClipData.newRawUri("foto", uri));
+            intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            pendingCaptureUri = uri;
+            pendingCaptureFile = photo;
+            startActivityForResult(intent, REQ_CAPTURE);
+            return true;
+        } catch (Exception e) {
+            pendingCaptureUri = null;
+            pendingCaptureFile = null;
+            Toast.makeText(this, "Kamera tidak bisa dibuka. Pilih foto dari galeri.", Toast.LENGTH_SHORT).show();
+            return false;
+        }
     }
 
     private void configureSystemBars() {
@@ -274,6 +318,19 @@ public final class MainActivity extends FragmentActivity {
                     }
                 }
                 pendingFileCallback.onReceiveValue(uris);
+                pendingFileCallback = null;
+            }
+        } else if (requestCode == REQ_CAPTURE) {
+            Uri captured = pendingCaptureUri;
+            File capturedFile = pendingCaptureFile;
+            pendingCaptureUri = null;
+            pendingCaptureFile = null;
+            if (pendingFileCallback != null) {
+                Uri[] result = null;
+                if (resultCode == RESULT_OK && captured != null && capturedFile != null && capturedFile.length() > 0) {
+                    result = new Uri[]{captured};
+                }
+                pendingFileCallback.onReceiveValue(result);
                 pendingFileCallback = null;
             }
         } else if (requestCode == REQ_CREATE_FILE) {

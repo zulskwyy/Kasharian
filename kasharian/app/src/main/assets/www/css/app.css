@@ -630,7 +630,7 @@ a.btn{display:flex;align-items:center;justify-content:center;text-decoration:non
 /* Secondary microcopy is hidden; important live feedback and source-trace details stay readable. */
 .note:not([aria-live]), .hint, .plan-note, .plan-hint, .funds-note, .chart-tip { display: none !important; }
 .note[aria-live]:not(:empty) { display: block !important; font-size: .9rem; line-height: 1.45; opacity: 1; margin: 8px 0; }
-.provenance-note, .about-note, .est-count { font-size: .88rem !important; line-height: 1.45 !important; overflow-wrap: anywhere; }
+.provenance-note, .est-count { font-size: .88rem !important; line-height: 1.45 !important; overflow-wrap: anywhere; }
 
 /* Kotak catatan (peringatan / cocok): selaras dengan kartu .stat, tanpa teks kuning tebal */
 p.warn-text:not(.total-line), p.ok-text:not(.total-line), div.warn-text:not(.total-line) {
@@ -653,3 +653,10 @@ p.ok-text:not(.total-line)::before { background: var(--in); }
 .spend-top-r { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; flex: none; }
 .spend-top-r strong { font-size: .98rem; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .spend-top-r small { font-size: .78rem; font-weight: 700; color: var(--muted); }
+
+/* Ajakan atur rencana di beranda */
+.plan-nudge { border: 1px solid var(--brand); }
+.plan-nudge strong { display: block; font-size: 1rem; font-weight: 750; }
+.plan-nudge p { margin: .35rem 0 .8rem; font-size: .9rem; line-height: 1.45; }
+.plan-nudge .btn-row { display: flex; gap: .5rem; }
+.plan-nudge .btn-row .btn { flex: 1; }
