@@ -660,3 +660,8 @@ p.ok-text:not(.total-line)::before { background: var(--in); }
 .plan-nudge p { margin: .35rem 0 .8rem; font-size: .9rem; line-height: 1.45; }
 .plan-nudge .btn-row { display: flex; gap: .5rem; }
 .plan-nudge .btn-row .btn { flex: 1; }
+
+/* Pemindaian: animasi dijalankan compositor, tidak ikut menghitung ulang tata letak */
+.scan-line { will-change: transform; }
+.scan-view { contain: layout paint; }
+.scan-ring-svg .val { will-change: stroke-dashoffset; }

@@ -63,6 +63,17 @@
     return workerPromise;
   }
 
+  /** Pratinjau ringan (maks 1000 px, JPEG) agar layar hasil tidak men-decode foto mentah berukuran belasan megapiksel. */
+  async function previewOf(src, file) {
+    try {
+      const long = Math.max(src.width, src.height), s = Math.min(1, 1000 / long), c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(src.width * s)); c.height = Math.max(1, Math.round(src.height * s));
+      c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+      const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.8));
+      if (blob && blob.size > 0) return URL.createObjectURL(blob);
+    } catch (e) { /* jatuh ke berkas asli */ }
+    return URL.createObjectURL(file);
+  }
   async function bitmapOf(file) {
     if (root.createImageBitmap) {
       try { return await createImageBitmap(file, { imageOrientation: 'from-image' }); } catch (e) { /* fall through */ }
@@ -84,14 +95,9 @@
     const flat = g.filter((v) => Math.abs(v - med) <= 22).length / g.length;
     return med < 100 && flat >= 0.55;           // latar gelap yang rata = layar mode gelap; foto struk di atas kain gelap tidak ikut terbalik
   }
-  /** Potong (sx,sy,sw,sh), perbesar/kecilkan, abu-abu, balik bila gelap, regangkan kontras. */
-  function prep(src, sx, sy, sw, sh, scale, invert, bin) {
-    const c = document.createElement('canvas');
-    c.width = Math.max(1, Math.round(sw * scale)); c.height = Math.max(1, Math.round(sh * scale));
-    const ctx = c.getContext('2d', { willReadFrequently: true }); ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
-    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
-    ctx.drawImage(src, sx, sy, sw, sh, 0, 0, c.width, c.height);
-    const img = ctx.getImageData(0, 0, c.width, c.height), d = img.data;
+  /** Putaran piksel murni (abu-abu, balik bila gelap, regangkan kontras, ambang Sauvola). Dijalankan di worker agar layar tetap bergerak;
+   *  fungsi ini juga dipakai sebagai cadangan di thread utama. Tidak boleh memakai variabel di luar dirinya selain sauvola. */
+  function pixelPass(d, W, H, invert, bin, win) {
     const hist = new Uint32Array(256); let sum = 0;
     for (let i = 0; i < d.length; i += 4) { let g = (d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000 | 0; if (invert) g = 255 - g; d[i] = g; hist[g]++; sum += g; }
     const n = d.length / 4, mean = sum / n;
@@ -100,9 +106,47 @@
     acc = 0; for (let i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= n * 0.02) { hi = i; break; } }
     const span = Math.max(40, hi - lo);
     for (let i = 0; i < d.length; i += 4) { const v = Math.max(0, Math.min(255, ((d[i] - lo) * 255) / span)) | 0; d[i] = d[i + 1] = d[i + 2] = v; }
-    if (bin) sauvola(d, c.width, c.height, Math.max(15, (Math.round(scale * 5) * 2) | 1));
-    ctx.putImageData(img, 0, 0);
-    return { canvas: c, quality: { width: sw, height: sh, mean, span, inverted: !!invert } };
+    if (bin) sauvola(d, W, H, win);
+    return { mean, span };
+  }
+  let pixWorker = null, pixSeq = 0; const pixWait = new Map();
+  function pixelWorker() {
+    if (pixWorker !== null) return pixWorker || null;
+    try {
+      if (typeof Worker === 'undefined' || typeof Blob === 'undefined') { pixWorker = false; return null; }
+      const code = pixelPass.toString() + '\n' + sauvola.toString() +
+        '\nonmessage=function(e){var m=e.data;try{var q=pixelPass(new Uint8ClampedArray(m.buf),m.W,m.H,m.invert,m.bin,m.win);postMessage({id:m.id,buf:m.buf,q:q},[m.buf]);}catch(x){postMessage({id:m.id,error:String(x&&x.message||x)});}};';
+      const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' })), w = new Worker(url);
+      w.onmessage = (e) => { const r = pixWait.get(e.data.id); if (r) { pixWait.delete(e.data.id); r(e.data); } };
+      w.onerror = () => { pixWorker = false; pixWait.forEach((r) => r({ error: 'worker' })); pixWait.clear(); try { w.terminate(); } catch (_) { /* sudah mati */ } };
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      pixWorker = w; return w;
+    } catch (e) { pixWorker = false; return null; }
+  }
+  /** Kirim salinan piksel ke worker; null bila worker tidak ada/gagal/terlalu lama (pemanggil memakai cadangan di thread utama). */
+  function runPixelPass(buf, W, H, invert, bin, win) {
+    const w = pixelWorker(); if (!w) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const id = ++pixSeq, t = setTimeout(() => { pixWait.delete(id); resolve(null); }, 60000);
+      pixWait.set(id, (r) => { clearTimeout(t); resolve(r.error ? null : r); });
+      try { const copy = buf.slice(0); w.postMessage({ id, buf: copy, W, H, invert, bin, win }, [copy]); } catch (e) { clearTimeout(t); pixWait.delete(id); resolve(null); }
+    });
+  }
+  const yieldUI = () => new Promise((r) => setTimeout(r, 0));
+  /** Potong (sx,sy,sw,sh), perbesar/kecilkan, abu-abu, balik bila gelap, regangkan kontras. Berat-piksel dijalankan di worker. */
+  async function prep(src, sx, sy, sw, sh, scale, invert, bin) {
+    await yieldUI();                                      // beri kesempatan layar menggambar tahap terbaru lebih dulu
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(sw * scale)); c.height = Math.max(1, Math.round(sh * scale));
+    const ctx = c.getContext('2d', { willReadFrequently: true }); ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(src, sx, sy, sw, sh, 0, 0, c.width, c.height);
+    const img = ctx.getImageData(0, 0, c.width, c.height), win = Math.max(15, (Math.round(scale * 5) * 2) | 1);
+    const viaWorker = await runPixelPass(img.data.buffer, c.width, c.height, !!invert, !!bin, win);
+    let q;
+    if (viaWorker) { q = viaWorker.q; ctx.putImageData(new ImageData(new Uint8ClampedArray(viaWorker.buf), c.width, c.height), 0, 0); }
+    else { q = pixelPass(img.data, c.width, c.height, !!invert, !!bin, win); ctx.putImageData(img, 0, 0); }
+    return { canvas: c, quality: { width: sw, height: sh, mean: q.mean, span: q.span, inverted: !!invert } };
   }
   /** Ambang lokal (Sauvola): membuat teks struk yang buram dan tidak rata pencahayaannya jadi hitam-putih yang tegas. */
   function sauvola(d, W, H, win) {
@@ -115,10 +159,10 @@
       const m = sum / n, sd = Math.sqrt(Math.max(0, sq / n - m * m)); out[y * W + x] = d[(y * W + x) * 4] > m * (1 + 0.2 * (sd / 128 - 1)) ? 255 : 0; } }
     for (let i = 0; i < out.length; i++) { const v = out[i]; d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v; }
   }
-  function preprocess(src) {
+  async function preprocess(src) {
     const w0 = src.width, h0 = src.height, long = Math.max(w0, h0);
     const scale = fitScale(long);
-    return prep(src, 0, 0, w0, h0, scale, isDark(src));
+    return await prep(src, 0, 0, w0, h0, scale, isDark(src));
   }
   /** Foto struk: satu kali baca. Screenshot panjang (riwayat transaksi): dipotong per bagian dengan tumpang tindih, ukuran teks dijaga. */
   async function ocrImage(src, name, type, onStage) {
@@ -132,7 +176,7 @@
     if (!tall) {
       const long = Math.max(W, H), scale = fitScale(long);
       onStage && onStage(shot ? 'Menyiapkan screenshot struk' : 'Meningkatkan keterbacaan gambar');
-      const pre = prep(src, 0, 0, W, H, scale, dark);
+      const pre = await prep(src, 0, 0, W, H, scale, dark);
       const r = await ocrCanvas(pre.canvas, 0, mode);
       return {
         words: r.words, confidence: r.confidence, quality: pre.quality, shot,
@@ -151,7 +195,7 @@
             try {
               const cap = Math.sqrt((bin ? 1_650_000 : 3_000_000) / pixels);
               const actualScale = Math.max(0.65, Math.min(sc, cap));
-              const p = prep(src, 0, 0, W, H, actualScale, dark, bin);
+              const p = await prep(src, 0, 0, W, H, actualScale, dark, bin);
               const rr = await ocrCanvas(p.canvas, 0, m);
               out.push(rr.words);
             } catch (e) { /* one alternate failing must not discard other attempts */ }
@@ -166,15 +210,15 @@
     for (let i = 0; i < tiles; i++) {
       const s0 = i * (th - ov), s1 = Math.min(H, s0 + th);
       onStage && onStage(`Membaca bagian ${i + 1} dari ${tiles}`);
-      const pre = prep(src, 0, s0, W, s1 - s0, scale, dark); quality = quality || pre.quality;
+      const pre = await prep(src, 0, s0, W, s1 - s0, scale, dark); quality = quality || pre.quality;
       const r = await ocrCanvas(pre.canvas, 0, mode); conf += r.confidence; n++;
       const lo = i ? s0 + ov / 2 : -1, hi = i === tiles - 1 ? Infinity : s0 + th - ov / 2;
       r.words.forEach((x) => { const y0 = s0 + x.y0 / scale, y1 = s0 + x.y1 / scale, yc = (y0 + y1) / 2; if (yc >= lo && yc < hi) words.push({ ...x, x0: x.x0 / scale, x1: x.x1 / scale, y0, y1 }); });
     }
     return { words, confidence: n ? conf / n : 0, quality, shot: true,
-      retry: async (onS) => { onS && onS('Membaca ulang bagian gambar dengan mode berbeda'); const p = prep(src, 0, 0, W, H, Math.min(1.5, 3000 / Math.max(W, H)), dark); return (await ocrCanvas(p.canvas, 0, '6')).words; },
+      retry: async (onS) => { onS && onS('Membaca ulang bagian gambar dengan mode berbeda'); const p = await prep(src, 0, 0, W, H, Math.min(1.5, 3000 / Math.max(W, H)), dark); return (await ocrCanvas(p.canvas, 0, '6')).words; },
       alts: pixels <= 4_500_000 && Math.max(W, H) <= 4200 ? async (onS) => {
-        const p = prep(src, 0, 0, W, H, Math.max(0.7, Math.min(1.25, Math.sqrt(3_000_000 / pixels))), dark, true);
+        const p = await prep(src, 0, 0, W, H, Math.max(0.7, Math.min(1.25, Math.sqrt(3_000_000 / pixels))), dark, true);
         onS && onS('Mencoba ambang kontras alternatif untuk screenshot panjang');
         return [(await ocrCanvas(p.canvas, 0, '6')).words, (await ocrCanvas(p.canvas, 0, '11')).words];
       } : null
@@ -269,7 +313,7 @@
       const view = page.getViewport({ scale: 2 });
       const c = document.createElement('canvas'); c.width = view.width; c.height = view.height;
       await page.render({ canvasContext: c.getContext('2d'), viewport: view }).promise;
-      const r = await ocrCanvas(preprocess(c).canvas, (p - 1) * 100000);
+      const r = await ocrCanvas((await preprocess(c)).canvas, (p - 1) * 100000);
       words = words.concat(r.words); conf += r.confidence / pages;
     }
     return { words, imageUrl: previewUrl, engine: 'OCR di perangkat', confidence: conf, advice: adviceFor(null, conf), warning };
@@ -292,8 +336,9 @@
       onStage && onStage('Menyiapkan gambar');
       const bmp = await bitmapOf(file);
       onStage && onStage('Menyiapkan mesin baca (sekali saja)');
+      const preview = await previewOf(bmp, file);
       const r = await ocrImage(bmp, file.name, type, onStage);
-      return done({ words: r.words, imageUrl: URL.createObjectURL(file), engine: 'OCR di perangkat', confidence: r.confidence, advice: adviceFor(r.quality, r.confidence), screenshot: r.shot, retry: r.retry, alts: r.alts });
+      return done({ words: r.words, imageUrl: preview, engine: 'OCR di perangkat', confidence: r.confidence, advice: adviceFor(r.quality, r.confidence), screenshot: r.shot, retry: r.retry, alts: r.alts });
     }
     throw new Error(`Jenis berkas "${file.name || type}" belum didukung. Pakai foto, PDF, Word (.docx), Excel (.xlsx), CSV, atau teks.`);
   }
@@ -342,5 +387,5 @@
   }
 
 
-  root.KHOCR = { readFiles, readFile: (f, s) => readFiles([f], s), selfTest, _workerParts: workerParts, _bytesFromB64: bytesFromB64 };
+  root.KHOCR = { reset: resetWorker, readFiles, readFile: (f, s) => readFiles([f], s), selfTest, _workerParts: workerParts, _bytesFromB64: bytesFromB64 };
 })(typeof self !== 'undefined' ? self : this);

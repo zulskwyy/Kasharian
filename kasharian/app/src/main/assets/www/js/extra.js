@@ -486,7 +486,10 @@
       // Baca ulang hanya bila hasilnya memang belum meyakinkan (nominal kosong, belum pasti, atau tidak ada baris total).
       // Keyakinan OCR yang rendah saja tidak cukup: foto struk dari HP hampir selalu di bawah 72%, dan setiap baca ulang
       // adalah satu putaran OCR penuh yang lambat di HP.
-      return !best || !best.amount || !best.sure || !((best.meta || {}).labTotal || []).length;
+      const settled = best && (best.sure || /dikoreksi/.test(best.how || ''));
+      // Nominal yang terbukti lewat hitungan (tunai - kembalian, subtotal + pajak, total = tunai) tidak perlu baca ulang walau kata "TOTAL" tidak terbaca.
+      const proven = best && best.sure && /hitungan tunai dan kembalian|subtotal ditambah pajak|sama dengan tunai|jumlah barang/.test(best.how || '');
+      return !best || !best.amount || !settled || (!proven && !((best.meta || {}).labTotal || []).length);
     };
     if (needsReview() && res.retry && !overBudget(60000)) {
       try {
@@ -508,6 +511,7 @@
   }
   /** Rank total candidates by explicit final-payment labels and arithmetic, not by the largest number on the receipt. */
   function voteReceipts(list) {
+    if (list.length === 1) return list[0];   // satu pembacaan: tidak ada yang perlu dipungut suara, pakai keputusan analisis
     const score = new Map(), add = (n, weight) => { if (Number.isSafeInteger(Number(n)) && Number(n) > 0) score.set(Number(n), (score.get(Number(n)) || 0) + weight); };
     list.forEach((x) => {
       const m = x.meta || {}, totals = [...new Set(m.labTotal || [])];

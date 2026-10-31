@@ -63,7 +63,25 @@
   /** Jalankan pembacaan berkas dengan layar proses. Mengembalikan null bila dibatalkan. */
   async function scanWith(files, run) {
     const ov = KHUI.scanOverlay({ file: files[0], count: files.length });
-    try { const r = await run((t) => ov.stage(t)); if (ov.cancelled) return null; await ov.finish(); return r; } finally { ov.close(); }
+    // Pengawas: bila tahap yang sama tidak berganti selama STALL_MS (atau total lewat MAX_MS), hentikan dan laporkan di tahap mana macetnya.
+    const STALL_MS = 90000, MAX_MS = 300000, t0 = Date.now();
+    let lastStage = 'Memulai', lastChange = t0, aborted = false, timer = null;
+    const guard = new Promise((_, reject) => {
+      timer = setInterval(() => {
+        const now = Date.now(); ov.tick && ov.tick(Math.round((now - t0) / 1000));
+        if (!aborted && (now - lastChange > STALL_MS || now - t0 > MAX_MS)) {
+          aborted = true;
+          reject(new Error('Pembacaan berhenti di tahap \"' + lastStage + '\" setelah ' + Math.round((now - t0) / 1000) + ' detik. Tutup aplikasi, buka lagi, lalu coba sekali lagi. Kalau terulang, kirim nama tahap ini ke pengembang.'));
+        }
+      }, 1000);
+    });
+    try {
+      const r = await Promise.race([run((t) => { const s = String(t || ''); if (s && s !== lastStage) { lastStage = s; lastChange = Date.now(); } ov.stage(t); }), guard]);
+      if (ov.cancelled) return null; await ov.finish(); return r;
+    } catch (e) {
+      if (aborted) { try { window.KHOCR && KHOCR.reset && await KHOCR.reset(); } catch (_) { /* mesin sudah mati */ } }
+      throw e;
+    } finally { clearInterval(timer); ov.close(); }
   }
   const themeButton = () => h('button', { class: 'theme-btn', type: 'button', 'aria-label': 'Ganti tampilan terang atau gelap', onclick: () => KHUI.Theme.toggle() }, h('span', { class: 'theme-glyph', 'aria-hidden': 'true' }));
   const card = (...kids) => h('section', { class: 'card' }, kids);

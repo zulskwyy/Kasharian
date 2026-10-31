@@ -116,7 +116,93 @@
     return '';
   };
   /** lines: [{text}] -> {amount, sure, choices:[n], how} */
-  function pickTotal(lines) { const r = pickTotal0(lines); return r; }
+  /** Lapisan penyaring di atas pickTotal0: memperbaiki kesalahan yang umum pada foto struk yang kurang jelas.
+   *  1) subtotal terpilih padahal ada angka total (subtotal + pajak) di bawahnya,
+   *  2) tebakan hitungan dari kumpulan angka acak (kebetulan cocok) dianggap benar,
+   *  3) angka total yang benar tidak masuk daftar pilihan karena daftar terpotong. */
+  function pickTotal(lines) {
+    const r = pickTotal0(lines);
+    try { return refineTotal(r, lines); } catch (e) { return r; }
+  }
+  const CONFUSE = { 0: [6, 8, 9], 1: [7], 2: [7], 3: [8, 5], 5: [6, 3], 6: [0, 8, 5], 7: [1], 8: [0, 6, 3, 9], 9: [0, 8, 4], 4: [9] };
+  /** Semua angka yang bisa muncul bila paling banyak `max` digit tertukar karena salah baca; nilai -> jumlah digit berubah. */
+  function digitVariants(n, max) {
+    const out = new Map([[n, 0]]); let layer = [[String(n), 0]];
+    for (let step = 1; step <= max; step++) {
+      const nxt = [];
+      for (const [str, ed] of layer) for (let i = 0; i < str.length; i++) for (const d of CONFUSE[+str[i]] || []) {
+        if (i === 0 && d === 0) continue;
+        const v = str.slice(0, i) + d + str.slice(i + 1), num = +v;
+        if (!out.has(num)) { out.set(num, ed + 1); nxt.push([v, ed + 1]); }
+      }
+      layer = nxt;
+    }
+    return out;
+  }
+  /** Cari total yang memenuhi: tunai - kembalian = total dan subtotal + pajak = total, dengan koreksi digit seminimal mungkin. */
+  function repairTotal(meta, subs, taxNums) {
+    const T0 = (meta.labTotal || []).slice(-1)[0], C0 = (meta.labCash || []).slice(-1)[0], K0 = (meta.labChange || [])[0];
+    if (!T0 || !C0 || !K0 || T0 < 1000) return null;
+    if (C0 - K0 === T0) return null;                          // sudah cocok, tidak perlu koreksi
+    const VT = digitVariants(T0, 2), VC = digitVariants(C0, 2), VK = digitVariants(K0, 2), A = new Map();
+    for (const [c, ec] of VC) for (const [k, ek] of VK) { const t = c - k; if (t > 0 && VT.has(t)) { const e = ec + ek + VT.get(t); if (!A.has(t) || e < A.get(t)) A.set(t, e); } }
+    if (!A.size) return null;
+    const taxes = [...taxNums].filter((n) => n >= 100), B = new Map();
+    for (const sub of subs) for (const tax of taxes) { const VS = digitVariants(sub, 2), VX = digitVariants(tax, 2); for (const [a, ea] of VS) for (const [b, eb] of VX) { const t = a + b; if (A.has(t) && b / a >= 0.02 && b / a <= 0.3) { const e = ea + eb; if (!B.has(t) || e < B.get(t)) B.set(t, e); } } }
+    const sols = [];
+    for (const [t, eA] of A) { const eB = B.has(t) ? B.get(t) : null; const strong = eB !== null, cost = eA + (strong ? eB : 3); if (!strong && eA > 3) continue; if (strong || cost <= 6) sols.push({ T: t, strong, cost }); }
+    // Total di struk Indonesia hampir selalu berakhir 00 atau 50; utamakan solusi seperti itu, lalu yang koreksinya paling sedikit.
+    sols.sort((x, y) => (y.strong - x.strong) || ((y.T % 50 === 0) - (x.T % 50 === 0)) || x.cost - y.cost);
+    return sols.length ? { T: sols[0].T, strong: sols[0].strong, alts: sols.slice(1, 4).map((x) => x.T) } : null;
+  }
+  function refineTotal(r0, lines) {
+    let r = r0;
+    const meta = r.meta || {}, pool = (meta.pool || []).slice();
+    if (!pool.length) return r;
+    const isQty = (t) => /\d\s*[x\u00d7]\s*\d/i.test(t), isSub = (t) => /(sub\s*-?\s*tot|s[ua]\w?\s*-?\s*tota?l)/i.test(t), isTax = (t) => /(ppn|pajak|\btax\b|pb1|service|servis)/i.test(t);
+    const where = new Map(), itemNums = new Set(), subNums = new Set(), taxNums = new Set();
+    lines.forEach((l, i) => {
+      const t = String(l.text || ''), am = amountsOf(t, true).map((x) => x.n); if (!am.length) return;
+      const itemLike = isQty(t) || ((t.match(/\p{L}/gu) || []).length >= 6 && am.length >= 2 && !isSub(t) && !isTax(t) && !/total|tunai|cash|kembali|change|bayar/i.test(t));
+      am.forEach((n) => { if (!where.has(n)) where.set(n, i); if (itemLike) itemNums.add(n); if (isSub(t)) subNums.add(n); if (isTax(t)) taxNums.add(n); });
+    });
+    const cashLike = new Set([...(meta.labCash || []), ...(meta.labChange || [])]);
+    const round = (n) => n >= 10000 && n % 10000 === 0;
+    const nonItem = pool.filter((n) => !itemNums.has(n) && !cashLike.has(n) && !taxNums.has(n));
+    const rank = (a, b) => (round(a) - round(b)) || b - a;
+    const items = meta.items > 0 ? meta.items : 0, subs = [...new Set([...subNums, ...(items >= 1000 && pool.includes(items) ? [items] : [])])];
+    const out = { ...r, meta: { ...meta } };
+    const dropSub = () => { out.meta.labTotal = (meta.labTotal || []).filter((n) => !subNums.has(n) && n !== items); };
+    const finish = () => {
+      const ordered = [out.amount, ...(r.choices || []), ...nonItem.slice().sort(rank), ...pool.filter((n) => itemNums.has(n)).sort((a, b) => b - a)];
+      const seen = []; ordered.forEach((n) => { if (n && !seen.includes(n)) seen.push(n); });
+      out.choices = seen.slice(0, 8); return out;
+    };
+    // 0) angka tercetak tidak saling cocok karena 1-2 digit salah baca (0/6/8, 1/7, dst.): pulihkan lewat hubungan antar angka
+    const rep = repairTotal(meta, [...subNums, ...(items >= 1000 ? [items] : [])], taxNums);
+    if (rep) {
+      // Koreksi digit hanya tebakan terbaik: selalu minta pengguna mencocokkan dengan foto, tapi alternatifnya disediakan di pilihan.
+      out.amount = rep.T; out.sure = false; out.how = 'dikoreksi dari angka yang saling cocok';
+      const printed = [(meta.labTotal || []).slice(-1)[0]].filter(Boolean);
+      r = { ...r, choices: [rep.T, ...rep.alts, ...printed, ...(r.choices || [])] }; return finish();
+    }
+    // 1) subtotal + pajak = total, semuanya terbaca di struk
+    let tier1 = 0;
+    for (const a of subs) for (const b of pool) { const T = a + b; if (b / a >= 0.02 && b / a <= 0.3 && pool.includes(T) && T > tier1) tier1 = T; }
+    const maxCash = Math.max(0, ...(meta.labCash || []));
+    if (tier1 && tier1 !== r.amount && (!maxCash || tier1 <= maxCash)) { out.amount = tier1; out.sure = !maxCash || (meta.labChange || []).some((k) => Math.abs(maxCash - k - tier1) <= 0); out.how = 'subtotal ditambah pajak'; dropSub(); out.meta.labTotal = [...out.meta.labTotal, tier1]; return finish(); }
+    // 2) hasil sekarang ternyata subtotal/harga barang: cari angka non-barang yang sedikit lebih besar di bawahnya
+    if (r.amount && (subNums.has(r.amount) || (itemNums.has(r.amount) && !(meta.labTotal || []).includes(r.amount)) || r.amount === items) && !(meta.labTotal || []).some((t) => t > r.amount * 1.02 && t <= r.amount * 1.3)) {
+      const after = nonItem.filter((n) => !round(n) && n > r.amount * 1.02 && n <= r.amount * 1.3 && (where.get(n) || 0) >= (where.get(r.amount) || 0));
+      if (after.length) { out.amount = Math.max(...after); out.sure = false; out.how = 'angka setelah subtotal'; dropSub(); return finish(); }
+    }
+    // 3) tebakan hitungan berskor rendah dari kumpulan angka banyak: terlalu mudah kebetulan, pakai angka non-barang terbesar yang bukan tunai bulat
+    if (r.how === 'hitungan' && pool.length > 5) {
+      const cand = nonItem.slice().sort(rank);
+      if (cand.length) { out.amount = cand[0]; out.sure = false; out.how = 'angka terbesar'; }
+    }
+    return finish();
+  }
   function pickTotal0(lines) {
     const rows = lines.map((l, i) => ({ i, text: String(l.text || ''), am: JUNK.test(l.text) && !/total/i.test(l.text) ? [] : amountsOf(l.text, !!labelOf(l.text) && labelOf(l.text) !== 'tax'), lab: labelOf(l.text), neg: /\(\s*[\d.,\s]{3,}\s*\)?\s*$/.test(l.text) || /voucher|vc\s|diskon|potongan/i.test(l.text) && /\(/.test(l.text) }));
     const withAm = rows.filter((r) => r.am.length);
@@ -150,6 +236,10 @@
     let best = null;
     for (const c of pool) for (const k of pool) {
       if (k >= c) continue; const T = c - k; if (T < 500) continue;
+      // Bayar non-tunai (QRIS, debit, e-wallet) tidak punya kembalian: jangan cari "kembalian" dari angka barang. Bila labelnya ada, pakai hanya angka berlabel.
+      if (labCash.length && !labChange.length) continue;
+      if (labChange.length && !labChange.includes(k)) continue;
+      if (labCash.length && !labCash.includes(c)) continue;
       const inPool = pool.includes(T); if (!inPool && !(labCash.includes(c) && labChange.includes(k))) continue;
       const ix = (n) => pool.indexOf(n), ord = inPool && ix(T) < ix(c) && ix(c) < ix(k) ? 1.5 : 0;
       const sc = (inPool ? 3 : 1.5) + ord + (labTotal.includes(T) ? 2 : 0) + (labCash.includes(c) ? 1 : 0) + (labChange.includes(k) ? 1 : 0);
@@ -157,7 +247,7 @@
     }
     if (best && best.sc >= 4) { add(best.T); labTotal.forEach(add); add(best.c); add(best.k); pool.forEach(add); return { amount: best.T, sure: true, how: 'hitungan tunai dan kembalian', choices: choices.slice(0, 6), meta }; }
     // 1b. total berlabel tidak cocok dengan tunai - kembalian: salah satu salah baca. Pilih yang sesuai jumlah barang.
-    const items = rows.filter((r) => !r.lab && r.am.length >= 1 && (r.neg || (fixNum(r.text).match(/\p{L}/gu) || []).length >= 3)).reduce((a, r) => a + (r.neg ? -1 : 1) * r.am[r.am.length - 1].n, 0);
+    const items = rows.filter((r) => !r.lab && r.am.length >= 1 && !/(sub\s*-?\s*tot|s[ua]\w?\s*-?\s*tota?l|ppn|pajak|\btax\b|pb1|service|servis)/i.test(r.text) && (r.neg || (fixNum(r.text).match(/\p{L}/gu) || []).length >= 3)).reduce((a, r) => a + (r.neg ? -1 : 1) * r.am[r.am.length - 1].n, 0);
     meta.items = items;
     if (labTotal.length && labCash.length && labChange.length) {
       const Tck = Math.max(...labCash) - labChange[0], Tl = labTotal[labTotal.length - 1];

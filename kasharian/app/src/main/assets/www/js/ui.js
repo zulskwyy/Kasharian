@@ -80,25 +80,41 @@
     const NS = 'http://www.w3.org/2000/svg', R0 = 46, C = 2 * Math.PI * R0;
     const isImg = file && (/^image\//.test(file.type || '') || /\.(png|jpe?g|webp|bmp|gif)$/i.test(file.name || '')), url = isImg ? URL.createObjectURL(file) : null;
     const ext = file && file.name ? (file.name.split('.').pop() || '').toUpperCase().slice(0, 4) : '';
+    // Pratinjau kecil: foto kamera belasan megapiksel tidak perlu di-decode penuh hanya untuk gambar mini ini.
+    const previewImg = h('img', { alt: 'Pratinjau berkas yang dibaca' });
+    let smallUrl = null, destroyed = false;
+    if (url) {
+      const useFull = () => { if (!destroyed) previewImg.src = url; };
+      if (typeof createImageBitmap === 'function') {
+        createImageBitmap(file, { resizeWidth: 720, resizeQuality: 'low', imageOrientation: 'from-image' }).then((bmp) => {
+          const c = document.createElement('canvas'); c.width = bmp.width; c.height = bmp.height; c.getContext('2d').drawImage(bmp, 0, 0); if (bmp.close) bmp.close();
+          c.toBlob((b) => { if (destroyed) return; if (b && b.size) { smallUrl = URL.createObjectURL(b); previewImg.src = smallUrl; } else useFull(); }, 'image/jpeg', 0.7);
+        }).catch(useFull);
+      } else useFull();
+    }
     const svg = document.createElementNS(NS, 'svg'); svg.setAttribute('viewBox', '0 0 100 100'); svg.setAttribute('class', 'scan-ring-svg'); svg.setAttribute('aria-hidden', 'true');
     const mkC = (cls) => { const c = document.createElementNS(NS, 'circle'); c.setAttribute('cx', 50); c.setAttribute('cy', 50); c.setAttribute('r', R0); c.setAttribute('class', cls); svg.append(c); return c; };
     mkC('trk'); const arc = mkC('val'); arc.setAttribute('stroke-dasharray', C); arc.setAttribute('stroke-dashoffset', C);
     const pctEl = h('strong', { class: 'scan-pct' }, '0%'), detail = h('p', { class: 'scan-detail', 'aria-live': 'polite' }, 'Memulai');
     const logList = h('ol', { class: 'scan-log-list' });
-    const logDetails = h('details', { class: 'scan-log' }, h('summary', null, 'Riwayat proses'), logList);
+    const logSum = h('summary', null, 'Riwayat proses');
+    const logDetails = h('details', { class: 'scan-log' }, logSum, logList);
     const stageHistory = [];
     const STEPS = ['Siapkan', 'Baca teks', 'Cocokkan'], stepEls = STEPS.map((t) => h('li', { class: 'scan-step' }, h('span', { class: 'scan-dot' }), h('span', null, t)));
-    const view = h('div', { class: 'scan-view' + (url ? '' : ' is-doc') }, url ? h('img', { src: url, alt: 'Pratinjau berkas yang dibaca' }) : h('div', { class: 'scan-doc' }, h('strong', null, ext || 'DOC'), h('small', null, count > 1 ? count + ' berkas' : 'Dokumen')),
+    const view = h('div', { class: 'scan-view' + (url ? '' : ' is-doc') }, url ? previewImg : h('div', { class: 'scan-doc' }, h('strong', null, ext || 'DOC'), h('small', null, count > 1 ? count + ' berkas' : 'Dokumen')),
       h('span', { class: 'scan-line' }), h('i', { class: 'c tl' }), h('i', { class: 'c tr' }), h('i', { class: 'c bl' }), h('i', { class: 'c br' }));
     let cancelled = false, p = 0, step = 0, closed = false;
     const cancelBtn = h('button', { class: 'btn ghost', type: 'button', onclick: () => { cancelled = true; api.close(); } }, 'Batal');
     const box = h('div', { class: 'scan', role: 'status' }, h('span', { class: 'scan-kicker' }, 'Memindai'), view,
       h('div', { class: 'scan-ring' }, svg, pctEl), h('ol', { class: 'scan-steps' }, stepEls), detail, logDetails, cancelBtn);
     const back = h('div', { class: 'scan-back', 'aria-modal': 'true', role: 'dialog', 'aria-label': 'Memindai berkas' }, box);
+    let pendingText = null, flushId = 0;
     const paint = () => {
       const v = Math.min(100, Math.max(0, p)); arc.setAttribute('stroke-dashoffset', C * (1 - v / 100)); pctEl.textContent = Math.round(v) + '%';
       stepEls.forEach((el, i) => { el.classList.toggle('done', i < step || v >= 100); el.classList.toggle('on', i === step && v < 100); });
     };
+    const flush = () => { flushId = 0; if (closed) return; if (pendingText !== null) { detail.textContent = pendingText; pendingText = null; } paint(); };
+    const scheduleFlush = () => { if (flushId) return; flushId = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame(flush) : setTimeout(flush, 16); };
     const CAP = [22, 72, 94];
     // Do not inflate the ring while OCR reports its real recognition percentage.
     // For preparation/matching steps, use a gentle phase indicator; during text
@@ -106,12 +122,15 @@
     const timer = setInterval(() => { if (step !== 1 && p < CAP[step]) { p += (CAP[step] - p) * 0.035; paint(); } }, 300);
     const api = {
       get cancelled() { return cancelled; },
+      tick(sec) { if (!closed) logSum.textContent = 'Riwayat proses · ' + sec + ' dtk'; },
+      history() { return stageHistory.slice(); },
       stage(text) {
         if (closed) return; const t = String(text || '');
         const cleanText = t.replace(/^\(\d+\/\d+\)\s*/, '');
-        detail.textContent = cleanText;
-        if (cleanText && stageHistory[stageHistory.length - 1] !== cleanText) {
-          stageHistory.push(cleanText);
+        pendingText = cleanText; scheduleFlush();               // teks dan kemajuan digambar paling banyak sekali per frame
+        const phase = cleanText.replace(/\s*\d+%\s*$/, '');    // riwayat mencatat tahap, bukan tiap persen
+        if (phase && stageHistory[stageHistory.length - 1] !== phase) {
+          stageHistory.push(phase);
           if (stageHistory.length > 12) stageHistory.shift();
           logList.replaceChildren(...stageHistory.map((entry) => h('li', null, entry)));
         }
@@ -121,10 +140,10 @@
         else if ((m = /(bagian|halaman)\s+(\d+)\s+dari\s+(\d+)/i.exec(t)) && !/ulang/i.test(t)) { s = 1; target = 22 + ((+m[2] - 1) / Math.max(1, +m[3])) * 46; }
         else if (/ulang|memeriksa|mencocokkan|pengaturan lain/i.test(t)) { s = 2; target = Math.max(72, p); if ((m = /\((\d+) dari (\d+)\)/.exec(t))) target = 72 + (+m[1] / +m[2]) * 20; }
         else if (/mesin baca|gambar|pdf|dokumen|word|excel/i.test(t)) { s = Math.max(step, 0); target = Math.max(p, 10); }
-        step = Math.max(step, s); p = Math.max(p, target); paint();
+        step = Math.max(step, s); p = Math.max(p, target); scheduleFlush();
       },
-      async finish() { if (closed) return; step = 2; p = 100; detail.textContent = 'Selesai'; paint(); await new Promise((r) => setTimeout(r, instant() ? 0 : 450)); },
-      close() { if (closed) return; closed = true; clearInterval(timer); if (url) setTimeout(() => URL.revokeObjectURL(url), 400); if (instant()) { back.remove(); return; } back.classList.add('is-closing'); setTimeout(() => back.remove(), 260); }
+      async finish() { if (closed) return; step = 2; p = 100; pendingText = null; detail.textContent = 'Selesai'; paint(); await new Promise((r) => setTimeout(r, instant() ? 0 : 450)); },
+      close() { if (closed) return; closed = true; destroyed = true; clearInterval(timer); if (url) setTimeout(() => URL.revokeObjectURL(url), 400); if (smallUrl) setTimeout(() => URL.revokeObjectURL(smallUrl), 400); if (instant()) { back.remove(); return; } back.classList.add('is-closing'); setTimeout(() => back.remove(), 260); }
     };
     paint(); document.body.append(back);
     return api;
