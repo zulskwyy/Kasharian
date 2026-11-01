@@ -41,7 +41,9 @@ import net.zetetic.database.sqlcipher.SQLiteDatabase;
 
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.security.KeyStore;
 import java.security.SecureRandom;
@@ -543,6 +545,62 @@ public final class MainActivity extends FragmentActivity {
                 try (Cursor c = secureDb.rawQuery("SELECT k FROM kh_secure_kv ORDER BY k LIMIT 1 OFFSET ?", new String[]{String.valueOf(index)})) {
                     return c.moveToFirst() ? c.getString(0) : null;
                 } catch (Exception e) { return null; }
+            }
+        }
+
+        /**
+         * Read only the bundled OCR runtime assets. This avoids WebView worker fetches to
+         * appassets.androidplatform.net, which can fail on some Android System WebView builds
+         * even though the files are present inside the APK. The allow-list prevents arbitrary
+         * asset disclosure through the JavaScript bridge.
+         */
+        @JavascriptInterface
+        public boolean hasOcrAssets() {
+            final String[] required = new String[]{
+                    "eng.traineddata.gz", "ind.traineddata.gz", "worker.min.js",
+                    "tesseract-core-simd-lstm.wasm.js", "tesseract-core-lstm-lowmem.wasm.js"
+            };
+            for (String name : required) {
+                try (InputStream in = MainActivity.this.getAssets().open("www/vendor/" +
+                        (name.endsWith("traineddata.gz") ? "tessdata/" : "tesseract/") + name)) {
+                    if (in.read() < 0) return false;
+                } catch (Exception e) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        @JavascriptInterface
+        public String readOcrAssetBase64(String name) {
+            if (name == null) return null;
+            final String folder;
+            switch (name) {
+                case "eng.traineddata.gz":
+                case "ind.traineddata.gz":
+                    folder = "tessdata/";
+                    break;
+                case "worker.min.js":
+                case "tesseract-core-simd-lstm.wasm.js":
+                case "tesseract-core-lstm-lowmem.wasm.js":
+                    folder = "tesseract/";
+                    break;
+                default:
+                    return null;
+            }
+            try (InputStream in = MainActivity.this.getAssets().open("www/vendor/" + folder + name);
+                 ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[16 * 1024];
+                int count;
+                int total = 0;
+                while ((count = in.read(buffer)) != -1) {
+                    total += count;
+                    if (total > 8 * 1024 * 1024) return null;
+                    out.write(buffer, 0, count);
+                }
+                return Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP);
+            } catch (Exception e) {
+                return null;
             }
         }
 

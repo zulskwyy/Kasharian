@@ -135,7 +135,7 @@
           logList.replaceChildren(...stageHistory.map((entry) => h('li', null, entry)));
         }
         let target = p, s = step, m;
-        if ((m = /mesin baca\s+(\d+)%/i.exec(t))) { s = 0; target = 8 + (+m[1]) * 0.14; }
+        if ((m = /mesin baca[^\d%]*(\d+)%/i.exec(t))) { s = 0; target = 8 + (+m[1]) * 0.14; }
         else if ((m = /membaca teks (\d+)%/i.exec(t))) { s = 1; target = 22 + (+m[1]) * 0.45; }
         else if ((m = /(bagian|halaman)\s+(\d+)\s+dari\s+(\d+)/i.exec(t)) && !/ulang/i.test(t)) { s = 1; target = 22 + ((+m[2] - 1) / Math.max(1, +m[3])) * 46; }
         else if (/ulang|memeriksa|mencocokkan|pengaturan lain/i.test(t)) { s = 2; target = Math.max(72, p); if ((m = /\((\d+) dari (\d+)\)/.exec(t))) target = 72 + (+m[1] / +m[2]) * 20; }

@@ -38,15 +38,126 @@
     return [head, engB64, middle, indB64 || engB64, tail, coreBytes, '\n', workerBytes];
   }
 
-  const CORES = [{ name: 'inti utama', path: 'vendor/tesseract/' }, { name: 'inti cadangan', path: 'vendor/tesseract/tesseract-core-lstm-lowmem.wasm.js' }];
-  let coreIdx = 0, worker = null, workerPromise = null, progressCb = null;
+  // Cara menyalakan mesin baca, dicoba berurutan. Penting: createWorker milik Tesseract menelan error pada tahap memuat bahasa dan
+  // inisialisasi (janjinya tidak pernah selesai), jadi tiap percobaan dipantau lewat errorHandler dan batas macet per tahap.
+  const STRATEGIES = [
+    { name: 'standar', core: 'vendor/tesseract/', embed: false },
+    { name: 'data bahasa dari memori', core: 'vendor/tesseract/', embed: true },
+    { name: 'mode kompatibilitas', core: 'vendor/tesseract/tesseract-core-lstm-lowmem.wasm.js', embed: true }
+  ];
+  const STALL_MS = 20000;
+  const STAGE_LABEL = (st) => /core/.test(st) ? 'memuat inti' : /initializing tesseract/.test(st) ? 'menyalakan WebAssembly' : /language/.test(st) ? 'memuat data bahasa' : /initializing api/.test(st) ? 'menyiapkan pembaca teks' : 'memulai';
+  // Cara menyalakan mesin yang terakhir berhasil diingat antar-peluncuran, agar tidak mengulang cara yang gagal di perangkat ini.
+  const prefStore = () => { try { return root.KHNativeStorage || root.localStorage || null; } catch (e) { return null; } };
+  const loadStrat = () => { try { const n = Number(prefStore() && prefStore().getItem('kh_ocr_strategy')); return Number.isInteger(n) && n >= 0 && n < STRATEGIES.length ? n : 0; } catch (e) { return 0; } };
+  const saveStrat = (n) => { try { const st = prefStore(); if (st && String(st.getItem('kh_ocr_strategy')) !== String(n)) st.setItem('kh_ocr_strategy', String(n)); } catch (e) { /* tidak penting */ } };
+  let stratIdx = 0, worker = null, workerPromise = null, progressCb = null, nativeWorkerBlobUrl = null;
+  const b64OfBuffer = (buf) => { const u = new Uint8Array(buf); let out = ''; for (let i = 0; i < u.length; i += 0x8000) out += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(out); };
+  const nativeOcrBridge = () => {
+    const bridge = root.KHNativeStorage;
+    return bridge && typeof bridge.readOcrAssetBase64 === 'function' ? bridge : null;
+  };
+  /** Android path: read the OCR runtime from APK assets using the native bridge.
+   *  WebView worker fetches are not reliable on every device/vendor; no appassets URL or
+   *  network permission is needed for language data, worker code, or the wasm core. */
+  async function startNativeEngine(logger) {
+    const bridge = nativeOcrBridge();
+    if (!bridge) throw new Error('Jembatan aset OCR Android tidak tersedia. Perbarui aplikasi KasHarian.');
+    await loadScript(abs('vendor/tesseract/tesseract.min.js'));
+    const read = (name) => {
+      const value = bridge.readOcrAssetBase64(name);
+      if (typeof value !== 'string' || value.length < 100) throw new Error('Aset OCR di APK tidak lengkap: ' + name + '. Pasang ulang APK KasHarian.');
+      return value;
+    };
+    if (typeof bridge.hasOcrAssets === 'function' && !bridge.hasOcrAssets()) {
+      throw new Error('Paket OCR di APK tidak lengkap. Buat ulang dan pasang APK KasHarian terbaru.');
+    }
+    const coreName = hasSimd() ? 'tesseract-core-simd-lstm.wasm.js' : 'tesseract-core-lstm-lowmem.wasm.js';
+    logger({ status: 'Memuat data OCR dari aplikasi', progress: 0 });
+    const eng = read('eng.traineddata.gz');
+    logger({ status: 'Memuat bahasa Indonesia', progress: 0.25 });
+    const ind = read('ind.traineddata.gz');
+    logger({ status: 'Menyiapkan inti OCR', progress: 0.5 });
+    const core = bytesFromB64(read(coreName));
+    const workerSource = bytesFromB64(read('worker.min.js'));
+    const parts = workerParts(core, workerSource, eng, ind);
+    const blobUrl = URL.createObjectURL(new Blob(parts, { type: 'text/javascript' }));
+    try {
+      const result = await new Promise((resolve, reject) => {
+        let settled = false, last = Date.now(), stage = 'memulai OCR lokal';
+        const finishError = (error) => {
+          if (settled) return;
+          settled = true;
+          clearInterval(timer);
+          reject(error instanceof Error ? error : new Error(String(error)));
+        };
+        const timer = setInterval(() => {
+          if (Date.now() - last > STALL_MS) finishError(new Error('Mesin OCR berhenti pada tahap ' + stage + '. Coba tutup aplikasi lain lalu ulangi pemindaian.'));
+        }, 1000);
+        const log = (message) => {
+          last = Date.now();
+          stage = STAGE_LABEL(String(message && message.status || stage));
+          logger(message);
+        };
+        try {
+          root.Tesseract.createWorker('ind+eng', 1, {
+            workerPath: blobUrl,
+            workerBlobURL: false,
+            langPath: 'https://kasharian.invalid/tessdata',
+            gzip: true,
+            cacheMethod: 'none',
+            logger: log,
+            errorHandler: finishError
+          }).then((created) => {
+            if (settled) { try { created.terminate(); } catch (_) {} return; }
+            settled = true;
+            clearInterval(timer);
+            resolve(created);
+          }, finishError);
+        } catch (error) {
+          finishError(error);
+        }
+      });
+      nativeWorkerBlobUrl = blobUrl;
+      return result;
+    } catch (error) {
+      URL.revokeObjectURL(blobUrl);
+      throw error;
+    }
+  }
+  /** Skrip worker (blob) yang menyajikan file bahasa dari memori lalu memuat worker Tesseract: tidak ada fetch dari dalam worker. */
+  async function langWorkerUrl(workerUrl) {
+    const get = async (name) => { const r = await fetch(abs('vendor/tessdata/' + name + '.traineddata.gz')); if (!r.ok) throw new Error('Gagal memuat ' + name + ' (' + r.status + ')'); return b64OfBuffer(await r.arrayBuffer()); };
+    const [eng, ind] = [await get('eng'), await get('ind')];
+    const head = '(function(){var D={eng:"', mid = '",ind:"', tail = '"};var f=self.fetch;self.fetch=function(u,o){var n=String(u).split("?")[0].split("/").pop().toLowerCase(),m=/^([a-z_]+)\\.traineddata(?:\\.gz)?$/.exec(n);if(m&&D[m[1]]){var b=atob(D[m[1]]),a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return Promise.resolve(new Response(a,{status:200}));}return f.apply(self,arguments);};})();\nimportScripts(' + JSON.stringify(workerUrl) + ');';
+    return URL.createObjectURL(new Blob([head, eng, mid, ind, tail], { type: 'text/javascript' }));
+  }
+  /** Satu percobaan menyalakan mesin. Gagal cepat dengan pesan asli bila ada error, atau bila satu tahap macet. */
+  async function startEngine(st, logger) {
+    let workerPath = abs('vendor/tesseract/worker.min.js'), blobUrl = null;
+    if (st.embed) workerPath = blobUrl = await langWorkerUrl(workerPath);
+    try {
+      return await new Promise((resolve, reject) => {
+        let done = false, last = Date.now(), stage = 'memulai';
+        const fail = (e) => { if (done) return; done = true; clearInterval(timer); reject(e instanceof Error ? e : new Error(String(e))); };
+        const timer = setInterval(() => { if (Date.now() - last > STALL_MS) fail(new Error('macet di tahap "' + stage + '" selama ' + Math.round((Date.now() - last) / 1000) + ' detik')); }, 1000);
+        const log = (m) => { last = Date.now(); stage = STAGE_LABEL(String(m && m.status || '')); logger(m); };
+        root.Tesseract.createWorker('ind+eng', 1, { workerPath, corePath: abs(st.core), langPath: abs('vendor/tessdata/'), gzip: true, workerBlobURL: false, cacheMethod: 'none', logger: log, errorHandler: (e) => fail(new Error(String(e))) })
+          .then((w) => { if (done) { try { w.terminate(); } catch (_) { /* sudah dibatalkan */ } return; } done = true; clearInterval(timer); resolve(w); }, fail);
+      });
+    } finally { if (blobUrl) setTimeout(() => URL.revokeObjectURL(blobUrl), 120000); }
+  }
   async function getWorker() {
     if (worker) return worker;
     if (!workerPromise) {
       workerPromise = (async () => {
         const logger = (m) => { if (progressCb) progressCb(m); };
-        if (!hasSimd()) throw new Error('Peramban ini belum mendukung WebAssembly SIMD yang dibutuhkan mesin baca. Perbarui Chrome/Firefox atau gunakan perangkat yang mendukung; data Anda tidak berubah.');
-        if (embedded()) {
+        const nativeBridge = nativeOcrBridge();
+        if (!hasSimd() && !embedded() && !nativeBridge) throw new Error('Peramban ini belum mendukung WebAssembly SIMD yang dibutuhkan mesin baca. Perbarui Chrome/Firefox atau gunakan perangkat yang mendukung; data Anda tidak berubah.');
+        if (nativeBridge) {
+          worker = await startNativeEngine(logger);
+          stratIdx = 0;
+        } else if (embedded()) {
           if (!root.Tesseract) throw new Error('Mesin baca tidak tersedia di halaman ini.');
           const el = (id) => { const node = document.getElementById(id); return node ? node.textContent.trim() : ''; };
           const eng = el('kh-lang'), ind = el('kh-lang-ind');
@@ -55,16 +166,14 @@
           worker = await root.Tesseract.createWorker(ind ? 'ind+eng' : 'eng', 1, { workerPath: url, workerBlobURL: false, langPath: 'https://kasharian.invalid/tessdata', gzip: true, cacheMethod: 'none', logger });
         } else {
           await loadScript(abs('vendor/tesseract/tesseract.min.js'));
-          // Inti WebAssembly dicoba berurutan. Inti utama memakai SIMD; cadangan tanpa SIMD dan dengan batas memori lebih kecil
-          // untuk WebView/perangkat yang menolak inti utama. Kegagalan sekarang dilaporkan (dulu ditelan dan membuat macet selamanya).
-          const errs = [];
-          for (let k = 0; k < CORES.length && !worker; k++) {
-            const idx = (coreIdx + k) % CORES.length, core = CORES[idx];
+          const errs = []; stratIdx = loadStrat();
+          for (let k = 0; k < STRATEGIES.length && !worker; k++) {
+            const idx = (stratIdx + k) % STRATEGIES.length, st = STRATEGIES[idx];
             try {
               if (k > 0 && progressCb) progressCb({ status: 'kompatibilitas', progress: 0 });
-              worker = await withTimeout(root.Tesseract.createWorker('ind+eng', 1, { workerPath: abs('vendor/tesseract/worker.min.js'), corePath: abs(core.path), langPath: abs('vendor/tessdata/'), gzip: true, workerBlobURL: false, cacheMethod: 'none', logger }), WORKER_INIT_MS, 'tidak ada respons dalam ' + Math.round(WORKER_INIT_MS / 1000) + ' detik');
-              coreIdx = idx;
-            } catch (e) { worker = null; errs.push(core.name + ': ' + String(e && e.message || e).slice(0, 280)); }
+              worker = await startEngine(st, logger);
+              stratIdx = idx; saveStrat(idx);
+            } catch (e) { worker = null; errs.push(st.name + ': ' + String(e && e.message || e).slice(0, 240)); }
           }
           if (!worker) {
             const ver = /Chrome\/([\d.]+)/.exec((root.navigator && navigator.userAgent) || '');
@@ -260,6 +369,7 @@
   async function resetWorker() {
     const w = worker; worker = null; workerPromise = null; curMode = null;
     if (w) { try { await w.terminate(); } catch (e) { /* sudah mati */ } }
+    if (nativeWorkerBlobUrl) { try { URL.revokeObjectURL(nativeWorkerBlobUrl); } catch (e) {} nativeWorkerBlobUrl = null; }
   }
   const shrink = (canvas, f) => { const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(canvas.width * f)); c.height = Math.max(1, Math.round(canvas.height * f)); const x = c.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(canvas, 0, 0, c.width, c.height); return c; };
   async function recognizeOnce(canvas, mode) {
@@ -349,7 +459,7 @@
       if (/^(heic|heif)$/.test(ext) || /heic|heif/.test(type)) { try { await createImageBitmap(file); } catch (e) { throw new Error('Format HEIC belum didukung di peramban ini. Ekspor gambar sebagai JPG, PNG, atau WEBP lalu coba lagi.'); } }
       onStage && onStage('Menyiapkan gambar');
       const bmp = await bitmapOf(file);
-      onStage && onStage('Menyiapkan mesin baca (sekali saja)');
+      onStage && onStage('Menyiapkan mesin baca \u00b7 memulai');
       const preview = await previewOf(bmp, file);
       const r = await ocrImage(bmp, file.name, type, onStage);
       return done({ words: r.words, imageUrl: preview, engine: 'OCR di perangkat', confidence: r.confidence, advice: adviceFor(r.quality, r.confidence), screenshot: r.shot, retry: r.retry, alts: r.alts });
@@ -365,7 +475,7 @@
       if (!onStage) return;
       if (m.status === 'recognizing text') onStage(`Membaca teks ${Math.round(m.progress * 100)}%`);
       else if (m.status === 'kompatibilitas') onStage('Mencoba mode kompatibilitas');
-      else if (/loading|initializ/.test(m.status)) onStage('Menyiapkan mesin baca' + (m.progress != null && m.progress > 0 ? ' ' + Math.round(m.progress * 100) + '%' : ' (sekali saja)'));
+      else if (/loading|initializ/.test(m.status)) onStage('Menyiapkan mesin baca \u00b7 ' + STAGE_LABEL(m.status) + (m.progress != null && m.progress > 0 ? ' ' + Math.round(m.progress * 100) + '%' : ''));
     };
     const results = [];
     for (let i = 0; i < list.length; i++) {
@@ -389,7 +499,9 @@
 
   /** Honest readiness report, shown on the slip screen. */
   async function selfTest() {
-    const r = { embedded: embedded(), wasm: typeof WebAssembly === 'object', simd: hasSimd(), worker: false, unzip: typeof DecompressionStream !== 'undefined' };
+    const bridge = nativeOcrBridge();
+    const nativeAssets = !!(bridge && (typeof bridge.hasOcrAssets !== 'function' || bridge.hasOcrAssets()));
+    const r = { embedded: embedded(), nativeOcr: !!bridge, nativeAssets, wasm: typeof WebAssembly === 'object', simd: hasSimd(), worker: false, unzip: typeof DecompressionStream !== 'undefined' };
     try {
       const u = URL.createObjectURL(new Blob(['postMessage(1)'], { type: 'text/javascript' }));
       r.worker = await new Promise((res) => {
@@ -397,7 +509,7 @@
         try { w = new Worker(u); w.onmessage = () => { clearTimeout(t); w.terminate(); res(true); }; w.onerror = () => { clearTimeout(t); res(false); }; } catch (e) { clearTimeout(t); res(false); }
       });
     } catch (e) { r.worker = false; }
-    r.photoOcr = r.wasm && r.simd && r.worker;
+    r.photoOcr = r.wasm && (r.simd || r.nativeOcr) && r.worker && (!r.nativeOcr || r.nativeAssets);
     return r;
   }
 
