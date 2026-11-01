@@ -1,4 +1,4 @@
-# Status Android v1.0.2
+# Status Android v1.0.3
 
 ## Yang sudah disiapkan di proyek
 
@@ -40,3 +40,9 @@ Data modelnya sendiri sehat (diuji: `ind+eng`, OEM LSTM, confidence 94 pada cont
 
 **Pengujian yang sudah dilakukan di sandbox:** kompilasi Java terhadap android.jar, uji perilaku `TessdataServer` (4 skenario), uji alur `ocr.js` (4 skenario), serta OCR end-to-end dengan `worker.min.js` + core WASM asli pada kondisi `.gz` = 404, `.gz` normal, dan core `lowmem`.
 **Belum teruji:** build APK dan jalan di perangkat Android sungguhan (tidak ada Android SDK di sandbox).
+
+## Perbaikan v1.0.3: setelah scan struk, saldo terasa tidak berkurang
+
+**Temuan:** hasil scan hanya masuk ke pratinjau di layar Catat dan baru mengurangi saldo setelah "Simpan catatan" ditekan. Tombol itu berada paling bawah (di bawah foto, kolom, teks hasil baca) dan toast lama hanya berkata "Struk terbaca". Kegagalan simpan (mis. saldo dompet kurang) juga hanya berupa toast singkat. Selain itu, struk bertanggal bulan lain tidak mengurangi angka "Sisa limit belanja" dan "Keluar" bulan ini (hanya pil Saldo).
+**Perbaikan:** (1) dialog "Simpan struk ini?" langsung setelah scan bila data lengkap, berisi toko, nominal, dompet, tanggal, dan peringatan jika tanggal bukan bulan ini; (2) tombol Simpan melekat di dasar layar (`.save-bar`); (3) kegagalan simpan menampilkan dialog yang tidak hilang sendiri; (4) toast sukses menyebut saldo dompet terbaru.
+**Pengujian:** aplikasi asli dijalankan di jsdom dengan hasil scan buatan pada skenario pemasukan ada, hanya saldo awal (limit habis), dompet pertama kosong, dan tanggal bulan lalu. Hasil: transaksi tersimpan dan saldo/limit berkurang sesuai.

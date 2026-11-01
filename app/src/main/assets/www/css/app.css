@@ -665,3 +665,8 @@ p.ok-text:not(.total-line)::before { background: var(--in); }
 .scan-line { will-change: transform; }
 .scan-view { contain: layout paint; }
 .scan-ring-svg .val { will-change: stroke-dashoffset; }
+
+/* Tombol Simpan pada pratinjau catatan tetap terlihat di dasar layar, tidak tersembunyi di bawah foto dan kolom. */
+.save-bar{position:sticky;bottom:0;z-index:5;margin:0 -16px;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:linear-gradient(to top,var(--bg) 80%,transparent)}
+.save-bar .btn.block{margin-top:0}
+.save-bar .error{margin:0 0 8px}

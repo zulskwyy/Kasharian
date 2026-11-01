@@ -676,12 +676,22 @@
         entries.push(mkEntry(x.merchant || 'Struk', { kind: 'EXPENSE', amount: x.amount, category: x.category, merchant: x.merchant, note: 'Struk', date: x.date || R.todayISO() }, { source: 'struk', imageUrl: r.res.imageUrl, ocrText: (window.KHScan && r.res.words ? KHScan.groupLines(r.res.words).lines.map((l) => l.text).join('\n') : (r.res.words || []).map((w) => w.text).join(' ')), term: (x.merchant || '').toLowerCase(), choices: x.choices || [], advice: (r.res.advice || []).join(' '), amountSure: !!x.sure, dateGuess: !x.date, remember: x.category !== 'Belum pasti' ? false : true }));
         const issues = []; if (!x.amount) issues.push('Nominal belum terbaca. Pilih angka di bawah foto atau isi sendiri.'); else if (!x.sure) issues.push('Nominal belum pasti. Cocokkan dengan foto, lalu ketuk angka yang benar.');
         if (x.sure === false || !x.amount) (r.res.advice || []).forEach((t) => issues.push(t));
-        if (issues.length) KHUI.notice(x.amount ? 'Periksa nominal' : 'Foto kurang jelas', h('div', null, issues.map((t) => h('p', null, t))), 'warn'); else toast('Struk terbaca');
+        if (issues.length) KHUI.notice(x.amount ? 'Periksa nominal' : 'Foto kurang jelas', h('div', null, issues.map((t) => h('p', null, t))), 'warn');
         drawPreview();
+        if (!issues.length) { try { await offerQuickSave(); } catch (e) { /* pratinjau tetap tampil; simpan manual */ } }
       } catch (e) {
         const act = await KHUI.notice('Scan belum berhasil', h('p', null, (e && e.message) || 'Berkas tidak bisa dibaca.'), 'error', [{ label: 'Isi manual', kind: 'ghost', value: 'manual' }, { label: 'Coba lagi', kind: 'primary', value: 'retry' }]);
         if (act === 'retry') return onFiles(files);
       }
+    }
+    /** Hasil scan baru masuk pratinjau dan BELUM mengurangi saldo sampai disimpan. Tanyakan langsung agar tidak terlewat. */
+    async function offerQuickSave() {
+      if (entries.length !== 1 || getEntryIssue()) return;      // hanya bila ini satu-satunya catatan dan sudah lengkap
+      const e = entries[0], thisMonth = R.monthOf(e.date) === R.monthOf(R.todayISO());
+      const lines = [`${e.merchant || 'Struk'} senilai ${R.rupiah(e.amount)} (${e.category}), dompet ${walletName(e.walletId)}, tanggal ${R.formatDate(e.date)}.`, 'Catatan ini belum tersimpan, jadi saldo belum berkurang.'];
+      if (!thisMonth) lines.push(`Tanggal struk jatuh di ${R.monthLabel(R.monthOf(e.date))}, jadi tidak mengurangi sisa limit bulan ini. Ubah tanggal bila salah baca.`);
+      if (await confirmBox('Simpan struk ini?', lines.join(' '), 'Simpan sekarang', 'Periksa dulu')) await save();
+      else { toast('Periksa isinya, lalu ketuk "Simpan catatan".'); const bar = box.querySelector('.save-bar'); if (bar && bar.scrollIntoView) try { bar.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (err) { /* tanpa opsi scroll */ } }
     }
     const attachCard = () => card(h('h3', null, 'Kirim foto atau dokumen'), null, KHExtra.attachButtons(onFiles, { cam: 'Foto struk' }), ast);
     const examples = ['mkn siang 25rb', 'bensin 30rb kemarin', 'gaji masuk 5jt', 'ngojek 120rb'];
@@ -783,7 +793,7 @@
           field('Catatan', h('input', { class: 'input', value: [e.merchant, e.note].filter(Boolean).join(' ').trim(), oninput: (ev) => { e.note = ev.target.value; e.merchant = null; } })), rem);
         return cardEl;
       });
-      box.replaceChildren(...cards, attachCard(), status, saveBtn, h('button', { class: 'btn ghost block', onclick: drawInput }, 'Ubah cerita'));
+      box.replaceChildren(...cards, attachCard(), h('div', { class: 'save-bar' }, status, saveBtn), h('button', { class: 'btn ghost block', onclick: drawInput }, 'Ubah cerita'));
       check();
     };
     function learn(e) {
@@ -809,8 +819,10 @@
           addActivity({ ...candidates[i], budgetSavingsUsed: candidates[i].budgetSavingsUsed || 0 });
           if (e.remember && e.term.trim() && e.category !== 'Belum pasti') { learn(e); learned++; }
         });
-        S.save(); toast((entries.length > 1 ? `${entries.length} catatan tersimpan` : 'Tersimpan') + (learned ? '. Kata diingat di Kamus saya.' : '')); KHExtra.notify(before); root('home');
-      } catch (err) { db().activities.splice(beforeCount); db().memory = beforeMemory; S.save(); toast(err.message); }
+        S.save();
+        const bal = R.BalanceEngine.balances(db().wallets, liveActs()), one = entries.length === 1 && entries[0].kind !== 'TRANSFER' ? entries[0] : null;
+        toast((entries.length > 1 ? `${entries.length} catatan tersimpan` : 'Tersimpan') + (one ? `. Saldo ${walletName(one.walletId)}: ${R.rupiah(Math.max(0, bal[one.walletId] || 0))}` : '') + (learned ? '. Kata diingat di Kamus saya.' : '')); KHExtra.notify(before); root('home');
+      } catch (err) { db().activities.splice(beforeCount); db().memory = beforeMemory; S.save(); KHUI.notice('Catatan belum tersimpan', h('p', null, err.message), 'error'); }
     }
     drawInput();
     return frame({ title: 'Catat', back: true, children: [box] });
