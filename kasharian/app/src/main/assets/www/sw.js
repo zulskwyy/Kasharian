@@ -1,6 +1,6 @@
 /* KasHarian web: offline cache. App files: network first (so updates arrive), cache fallback.
    /vendor files (OCR engine, language data, pdf.js): cache first because they are large and never change. */
-const BUILD = '20261101190000';
+const BUILD = '20261101200000';
 const CACHE = 'kh-web-' + BUILD;
 const SHELL = ['./', 'index.html', 'css/app.css', 'manifest.webmanifest', 'icons/logo.svg', 'icons/icon-192.png',
   'js/theme-early.js', 'js/i18n-en.js', 'js/i18n.js', 'js/rules.js', 'js/slip.js', 'js/store.js', 'js/ui.js', 'js/app.js', 'js/backup.js', 'js/charts.js', 'js/more.js', 'js/recovery.js', 'js/slipui.js', 'js/scan.js', 'js/bucket.js', 'js/extra.js', 'js/habit.js', 'js/statement.js', 'js/tidy.js', 'js/docs.js', 'js/ocr.js', 'js/boot.js'];

@@ -19,3 +19,8 @@ Diuji dengan OCR sungguhan (Tesseract bawaan aplikasi, Chromium headless) pada t
 ## Pengujian
 `bash scripts/check-web-assets.sh` kini juga menjalankan `scripts/history-ocr-regression.test.js` dengan fixture OCR asli (`scripts/fixtures`).
 Data yang sudah tersimpan dari versi lama tidak diperbaiki otomatis: ubah catatan transfer ke rekening sendiri menjadi Pindah dana (atau hapus lalu impor ulang).
+
+## Tambahan v1.0.10: saldo dan sumber dana
+- Angka utama beranda kini **saldo sebenarnya** (semua transaksi, termasuk bulan lalu). Sisa limit bulanan menjadi kotak terpisah. Sebelumnya angka utama adalah limit bulan berjalan sehingga transaksi 31 Okt tidak terlihat mengurangi.
+- Bila dompet transaksi kurang, kekurangan ditutup berurutan dari semua dompet lain: dompet biasa/tunai, dana darurat, lalu tabungan, dengan konfirmasi dan pindah dana nyata. Sebelumnya hanya dompet biasa yang dihitung.
+- Uji acak 450 transaksi (3 jenis planning, termasuk 50/30/10/10 dengan dompet tabungan dan darurat): total saldo selalu berubah tepat sebesar masuk dikurangi keluar, tanpa dompet negatif.

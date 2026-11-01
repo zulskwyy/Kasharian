@@ -5,7 +5,7 @@
   const R = KHRules, S = KHStore, { h, toast, modal, confirmBox, pinPad, moneyInput } = KHUI;
   const $app = document.getElementById('app');
   const db = () => S.db;
-  const VERSION = '1.0.9';
+  const VERSION = '1.0.10';
 
   // ---------- state ----------
   const session = { unlocked: false, email: null, flow: null };
@@ -130,7 +130,7 @@
     const pos = (w) => Math.max(0, Number(balances[w.id]) || 0);
     const freeSources = db().wallets.filter((w) => !w.archived && w.type !== 'SAVINGS' && w.type !== 'EMERGENCY' && w.id !== rec.walletId).sort((x, y) => pos(y) - pos(x)).map((w) => ({ wallet: w, available: pos(w) }));
     const kinds = Array.isArray(rec.budgetSavingsKinds) && rec.budgetSavingsKinds.length ? rec.budgetSavingsKinds : ['SAVINGS', 'EMERGENCY'];
-    const savingSources = db().wallets.filter((w) => !w.archived && kinds.includes(w.type) && w.id !== rec.walletId).map((w) => ({ wallet: w, available: pos(w) }));
+    const savingSources = db().wallets.filter((w) => !w.archived && kinds.includes(w.type) && w.id !== rec.walletId).map((w) => ({ wallet: w, available: pos(w) })).sort((x, y) => (x.wallet.type === 'EMERGENCY' ? 0 : 1) - (y.wallet.type === 'EMERGENCY' ? 0 : 1));
     // uang di luar rencana hanya dipindah sebesar kekurangan saldo dompet; tabungan dipindah sebesar yang disetujui
     const freeNeed = Math.min(shortfall, authFree), freeAvail = freeSources.reduce((n, x) => n + x.available, 0);
     const savAvail = savingSources.reduce((n, x) => n + x.available, 0);
@@ -306,25 +306,41 @@
     const authorizedOf = (x) => Math.max(0, Number(x.budgetSavingsUsed) || 0) + Math.max(0, Number(x.budgetFreeUsed) || 0) + Math.max(0, Number(x.budgetTopUp) || 0);
     let unfunded = walletShortfalls.filter((x) => authorizedOf(x.item) < x.shortfall);
     if (unfunded.length) {
-      // Kekurangan saldo dompet di dalam limit: tawarkan memindahkan dari dompet dan uang tunai lain lebih dulu.
+      // Kekurangan saldo dompet transaksi: tutup dari semua dompet lain secara berurutan: 1) dompet biasa dan tunai, 2) dana darurat, 3) tabungan.
       const balances = R.BalanceEngine.balances(db().wallets, liveActs());
-      const others = (wid) => activeWallets().filter((w) => w.id !== wid && w.type !== 'SAVINGS' && w.type !== 'EMERGENCY').map((w) => ({ name: w.name, amount: Math.max(0, Number(balances[w.id]) || 0) })).filter((o) => o.amount > 0);
-      const x0 = unfunded[0], need0 = x0.shortfall - authorizedOf(x0.item), pool0 = others(x0.item.walletId), poolTotal = pool0.reduce((n, o) => n + o.amount, 0);
-      if (poolTotal >= need0) {
-        const r = await modal({ title: 'Saldo dompet tidak cukup', tone: 'warn', body: [h('p', null, `${walletName(x0.item.walletId)} kurang ${R.rupiah(need0)}. Pindahkan dari:`), h('div', { class: 'ladder' }, pool0.map((o, i) => h('div', { class: 'ladder-row on static' }, h('span', { class: 'ladder-no' }, String(i + 1)), h('span', { class: 'ladder-main' }, h('strong', null, o.name)), h('strong', { class: 'ladder-amt' }, R.rupiah(o.amount)))))],
-          buttons: [{ label: 'Kembali', kind: 'ghost', value: false }, { label: 'Pindahkan otomatis', kind: 'primary', value: 'move' }] });
-        if (r !== 'move') return false;
-        for (const x of unfunded) { const need = x.shortfall - authorizedOf(x.item); if (need > 0 && others(x.item.walletId).reduce((n, o) => n + o.amount, 0) >= need) x.item.budgetTopUp = (Number(x.item.budgetTopUp) || 0) + need; }
-        unfunded = walletShortfalls.filter((x) => authorizedOf(x.item) < x.shortfall);
+      const TIER = ['free', 'emergency', 'savings'], TLABEL = { free: 'Dompet dan uang tunai lain', emergency: 'Dana darurat', savings: 'Tabungan' };
+      const tierOf = (w) => (w.type === 'EMERGENCY' ? 'emergency' : w.type === 'SAVINGS' ? 'savings' : 'free');
+      const rem = new Map(activeWallets().map((w) => [w.id, Math.max(0, Number(balances[w.id]) || 0)]));
+      const sources = activeWallets().map((w) => ({ w, tier: tierOf(w) })).sort((p1, p2) => TIER.indexOf(p1.tier) - TIER.indexOf(p2.tier) || (rem.get(p2.w.id) - rem.get(p1.w.id)));
+      const plans = [], used = new Map(); let short = null;
+      for (const x of unfunded) {
+        let need = x.shortfall - authorizedOf(x.item); const part = { free: 0, emergency: 0, savings: 0 };
+        for (const src of sources) {
+          if (need <= 0) break; if (src.w.id === x.item.walletId) continue;
+          const take = Math.min(need, rem.get(src.w.id) || 0); if (take <= 0) continue;
+          rem.set(src.w.id, rem.get(src.w.id) - take); need -= take; part[src.tier] += take; used.set(src.w.id, (used.get(src.w.id) || 0) + take);
+        }
+        if (need > 0) { short = { x, need }; break; }
+        plans.push({ x, part });
       }
-      if (unfunded.length) {
-        const x = unfunded[0];
+      if (short) {
+        const x = short.x, all = activeWallets().filter((w) => w.id !== x.item.walletId).map((w) => [w.name, Math.max(0, Number(balances[w.id]) || 0)]).filter((v) => v[1] > 0);
         await modal({ title: 'Saldo dompet tidak cukup', tone: 'warn', body: [
           h('p', null, `${walletName(x.item.walletId)} memiliki ${R.rupiah(x.available)}, transaksi ${R.rupiah(Math.max(0, R.ledgerAmountValue(x.item.amount)))}.`),
-          (() => { const b = R.BalanceEngine.balances(db().wallets, liveActs()), rest = activeWallets().filter((w) => w.id !== x.item.walletId).map((w) => [w.name, Math.max(0, Number(b[w.id]) || 0)]).filter((v) => v[1] > 0);
-            return rest.length ? h('p', null, 'Saldo dompet lain di KasHarian: ' + rest.map(([n, v]) => `${n} ${R.rupiah(v)}`).join(', ') + '. Pilih dompet itu, atau periksa apakah ada transfer ke rekening sendiri yang tercatat sebagai pengeluaran (ubah jadi Pindah dana).') : null; })(),
-          h('p', null, 'Pilih dompet dengan saldo cukup atau catat pemasukan terlebih dahulu.')], buttons: [{ label: 'Kembali', kind: 'primary', value: false }] });
+          h('p', null, all.length ? `Semua dompet lain, dana darurat, dan tabungan hanya memiliki ${R.rupiah(all.reduce((n, v) => n + v[1], 0))} (${all.map(([n, v]) => `${n} ${R.rupiah(v)}`).join(', ')}), masih kurang ${R.rupiah(short.need)}.` : 'Tidak ada dompet lain yang memiliki saldo.'),
+          h('p', null, 'Catat pemasukan terlebih dahulu, atau periksa apakah ada transfer ke rekening sendiri yang tercatat sebagai pengeluaran (ubah jadi Pindah dana).')], buttons: [{ label: 'Kembali', kind: 'primary', value: false }] });
         return false;
+      }
+      const lines = [...used.entries()].map(([id, amt]) => { const w = db().wallets.find((v) => v.id === id); return { name: w.name, tier: tierOf(w), amt }; });
+      const r = await modal({ title: 'Saldo dompet tidak cukup', tone: 'warn', body: [h('p', null, `${walletName(plans[0].x.item.walletId)} kurang ${R.rupiah(plans.reduce((n, p) => n + p.x.shortfall - authorizedOf(p.x.item), 0))}. Dana dipindahkan dari:`),
+        h('div', { class: 'ladder' }, lines.map((o, i) => h('div', { class: 'ladder-row on static' }, h('span', { class: 'ladder-no' }, String(i + 1)), h('span', { class: 'ladder-main' }, h('strong', null, o.name), h('small', null, TLABEL[o.tier])), h('strong', { class: 'ladder-amt' }, R.rupiah(o.amt)))))],
+        buttons: [{ label: 'Kembali', kind: 'ghost', value: false }, { label: 'Pindahkan otomatis', kind: 'primary', value: 'move' }] });
+      if (r !== 'move') return false;
+      for (const { x, part } of plans) {
+        const it = x.item, kinds = new Set(Array.isArray(it.budgetSavingsKinds) ? it.budgetSavingsKinds : []);
+        it.budgetTopUp = (Number(it.budgetTopUp) || 0) + part.free;
+        const sv = part.emergency + part.savings;
+        if (sv > 0) { it.budgetSavingsUsed = (Number(it.budgetSavingsUsed) || 0) + sv; if (part.emergency) kinds.add('EMERGENCY'); if (part.savings) kinds.add('SAVINGS'); it.budgetSavingsKinds = [...kinds]; }
       }
     }
     return true;
@@ -625,7 +641,7 @@
     const p = db().profile;
     const budgetState = window.KHExtra && typeof KHExtra.state === 'function' ? KHExtra.state(ym) : null;
     const ledger = R.BalanceEngine.balances(ws, liveActs());
-    const shownBalance = () => budgetState ? Math.max(0, Number(budgetState.spendable) || 0) : (one ? (ledger[one.id] || 0) : totalBalance());
+    const shownBalance = () => (one ? (ledger[one.id] || 0) : totalBalance());   // angka utama = saldo sebenarnya semua transaksi (termasuk bulan lalu); limit bulanan ditampilkan terpisah
     const bal = h('div', { class: 'big hero-spendable', 'aria-live': 'polite' }, R.rupiah(0));
     setTimeout(() => countUp(bal, shownBalance()), 0);
     const viewChips = ws.length > 1 ? h('div', { class: 'chips hero-views', role: 'group', 'aria-label': 'Tampilan dompet' }, [{ id: 'ALL', name: 'Semua' }, ...ws].map((w) => h('button', { class: 'chip' + (homeView === w.id ? ' on' : ''), onclick: () => { homeView = w.id; render(); } }, w.name))) : null;
@@ -651,8 +667,8 @@
     return frame({ title: 'KasHarian', tabs: 'home', left: themeButton(), right: h('button', { class: 'avatar-btn', 'aria-label': 'Profil', onclick: () => go('profile') }, avatarEl(p, 36)), children: [
       planNudge,
       h('section', { class: 'card hero home-budget-hero' },
-        h('small', { class: 'hero-kicker' }, budgetState ? 'SISA LIMIT BELANJA' : 'UANG ANDA SEKARANG'), bal,
-        h('div', { class: 'hero-pills' }, h('span', { class: 'pill' }, h('small', null, one ? one.name : 'Saldo'), h('strong', null, R.rupiah(one ? (ledger[one.id] || 0) : totalBalance()))),
+        h('small', { class: 'hero-kicker' }, one ? 'SALDO ' + one.name.toUpperCase() : 'TOTAL SALDO SEKARANG'), bal,
+        h('div', { class: 'hero-pills' }, budgetState ? h('span', { class: 'pill' }, h('small', null, 'Sisa limit bulan ini'), h('strong', null, R.rupiah(Math.max(0, Number(budgetState.spendable) || 0)))) : null,
           budgetState ? h('span', { class: 'pill save' }, h('small', null, 'Tabungan'), h('strong', null, R.rupiah(budgetState.savingsProgress))) : null),
         exhausted ? h('div', { class: 'budget-exhausted' }, h('strong', null, budgetState.spendingBudget <= 0 ? 'Belum ada limit aktif' : 'Limit bulan ini habis'),
           h('button', { class: 'btn primary sm', onclick: () => go('catat') }, 'Catat pemasukan')) : null,
