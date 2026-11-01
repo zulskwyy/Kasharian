@@ -440,8 +440,10 @@
     if ((all.match(new RegExp(SLIP_HINT.source, 'gi')) || []).length >= 2 && /gaji|salary/i.test(all)) return { kind: 'slip' };
     const sc = KHScan.analyzeReceipt(lines, R.todayISO());
     let category = sc.brandCat || 'Belum pasti';
-    if (category === 'Belum pasti') for (const t of [sc.merchant || '', ...texts.slice(0, 25)]) { if (!t) continue; const c = R.FreeTextParser.parse(t, R.todayISO(), db().memory).category; if (c !== 'Belum pasti') { category = c; break; } }
-    const mem = db().memory.slice().sort((x, y) => y.term.length - x.term.length).find((m) => m.term && all.toLowerCase().includes(m.term));
+    if (category === 'Belum pasti') for (const t of [sc.merchant || '', ...texts.slice(0, 25)]) { if (!t) continue; const c = R.FreeTextParser.parse(t, R.todayISO(), R.cleanMemory(db().memory).filter((m) => m.kind === 'EXPENSE')).category; if (c !== 'Belum pasti' && R.CAT.expense.includes(c)) { category = c; break; } }
+    // Struk selalu pengeluaran: hanya Kamus berjenis Keluar dengan kategori pengeluaran yang sah, cocok per kata utuh.
+    const mem = R.cleanMemory(db().memory).filter((m) => m.kind === 'EXPENSE' && R.CAT.expense.includes(m.category)).sort((x, y) => y.term.length - x.term.length)
+      .find((m) => R.findLearned([m], R.FreeTextParser.normalize(all)));
     if (mem && mem.category) category = mem.category;
     return { kind: 'receipt', meta: sc.meta, amount: sc.amount, sure: sc.sure, how: sc.how, choices: sc.choices, merchant: sc.merchant, date: sc.date, due: sc.due, category, isBill: sc.isBill, lines: texts.length };
   }

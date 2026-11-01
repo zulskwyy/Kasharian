@@ -172,3 +172,58 @@ App.addActivity({ type: R.FreeTextParser.parse('mkn siang 25rb', '2026-11-01').k
 assert.equal(App.totalBalance(), 1000000, 'The final Rp25,000 expense debits the wallet after earlier income and expenses.');
 
 console.log('Ledger + Planning + Catat regression tests passed.');
+
+// ---- v1.0.8: Kamus saya tidak boleh membalik arah transaksi; kegagalan simpan native tidak boleh dianggap sukses ----
+const poisoned = [
+  { term: '', kind: 'INCOME', category: 'Lainnya' },
+  { term: 'a', kind: 'INCOME', category: 'Lainnya' },
+  { term: 'mkn', kind: 'INCOME', category: 'Lainnya' },
+  { term: 'makan', kind: 'masuk', category: 'Lainnya' }
+];
+poisoned.forEach((m) => {
+  const parsed = R.FreeTextParser.parse('mkn siang 25rb', '2026-11-01', [m]);
+  assert.equal(parsed.kind, 'EXPENSE', 'Kamus rusak/terlalu pendek tidak boleh mengubah pengeluaran jadi pemasukan: ' + JSON.stringify(m));
+});
+assert.equal(R.FreeTextParser.parse('ngojek 120rb', '2026-11-01', [{ term: 'ngojek', kind: 'INCOME', category: 'Pendapatan harian' }]).kind, 'INCOME', 'Kamus yang sah tetap bekerja');
+assert.deepEqual(R.cleanMemory([{ term: '', kind: 'INCOME' }, { term: 'ab', kind: 'EXPENSE' }, { term: 'warung', kind: 'keluar' }, { term: 'kopi', kind: 'zzz' }]).map((m) => [m.term, m.kind]), [['warung', 'EXPENSE']]);
+
+const failing = new Map();
+failing.set('kh_web_db_v1', JSON.stringify({ v: 3, wallets, activities: [], memory: [{ term: '', kind: 'INCOME' }, { term: 'warung', kind: 'EXPENSE', category: 'Makan dan minum' }] }));
+let writeOk = true;
+global.self = { KHRules: R, KHNativeStorage: { getItem: (k) => failing.has(k) ? failing.get(k) : null, setItem: (k, v) => { if (!writeOk) return false; failing.set(k, v); return true; }, removeItem: () => true }, crypto: undefined };
+delete require.cache[require.resolve(storePath)];
+require(storePath);
+assert.deepEqual(global.self.KHStore.db.memory.map((m) => m.term), ['warung'], 'Kamus rusak dibersihkan saat database dimuat');
+assert.equal(global.self.KHStore.save(), true);
+writeOk = false;
+assert.equal(global.self.KHStore.save(), false, 'Bridge Android yang mengembalikan false harus dilaporkan sebagai gagal simpan');
+
+// Jalur Catat penuh dengan Planning nyata: pengeluaran 25rb mengurangi saldo dan menambah Keluar, bukan Masuk.
+(async () => {
+  let n2 = 0;
+  const db2 = { wallets: [{ id: 'w1', name: 'Tunai', type: 'CASH', openingBalance: 0, includeInTotal: true, archived: false }], activities: [], memory: [{ term: 'mkn', kind: 'INCOME', category: 'Lainnya' }], bills: [], slips: [], settings: {}, plan: null };
+  global.window = global; global.self = global; global.KHRules = R; global.KHBucket = require(path.join(ROOT, 'app/src/main/assets/www/js/bucket.js'));
+  global.KHStore = { db: db2, uid: () => 'e2e' + (++n2), save: () => true };
+  global.KHUI = { h() { return {}; }, toast() {}, modal: async () => 'use', confirmBox() {}, pinPad() {}, moneyInput() {} };
+  delete require.cache[require.resolve(path.join(ROOT, 'app/src/main/assets/www/js/app.js'))];
+  delete require.cache[require.resolve(path.join(ROOT, 'app/src/main/assets/www/js/extra.js'))];
+  require(path.join(ROOT, 'app/src/main/assets/www/js/app.js'));
+  require(path.join(ROOT, 'app/src/main/assets/www/js/extra.js'));
+  const A2 = global.KHApp;
+  A2.addActivity({ type: 'INCOME', amount: 5309932, walletId: 'w1', category: 'Gaji', source: 'slip' });
+  const parsed = R.FreeTextParser.parse('mkn siang 25rb', R.todayISO(), db2.memory);
+  assert.equal(parsed.kind, 'EXPENSE');
+  const cand = [{ type: parsed.kind, amount: parsed.amount, walletId: 'w1', toWalletId: null, category: parsed.category, occurredOn: R.todayISO(), note: parsed.note, source: 'cerita' }];
+  assert.equal(await A2.authorizeActivities(cand), true);
+  A2.addActivity({ ...cand[0], budgetSavingsUsed: 0 });
+  const month = R.SummaryEngine.month(A2.liveActs(), R.monthOf(R.todayISO()));
+  assert.equal(A2.totalBalance(), 5284932, 'Saldo berkurang 25.000 setelah pengeluaran Catat');
+  assert.equal(month.income, 5309932); assert.equal(month.expense, 25000);
+  // Struk OCR: draf pengeluaran dengan sumber "struk" juga mengurangi saldo.
+  const ocr = [{ type: 'EXPENSE', amount: 25000, walletId: 'w1', toWalletId: null, category: 'Belanja', occurredOn: R.todayISO(), merchant: 'Indomaret', note: 'Struk', source: 'struk' }];
+  assert.equal(await A2.authorizeActivities(ocr), true);
+  A2.addActivity({ ...ocr[0], budgetSavingsUsed: 0 });
+  assert.equal(A2.totalBalance(), 5259932, 'Saldo berkurang untuk pengeluaran hasil OCR struk');
+  console.log('Catat + OCR + Kamus + native-save regression (v1.0.8) passed.');
+})().catch((e) => { console.error(e); process.exitCode = 1; });
+

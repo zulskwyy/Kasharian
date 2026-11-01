@@ -230,6 +230,35 @@
     return note;
   }
 
+
+  // ---------- Kamus saya (kata yang diingat) ----------
+  // Kamus hanya boleh memakai jenis yang sah, kata yang cukup spesifik, dan cocok per kata utuh.
+  // Sebelumnya cocok per potongan teks sehingga satu entri salah (mis. kata kosong atau "a") dapat
+  // membalik "mkn siang 25rb" menjadi pemasukan tanpa disadari.
+  const MEMORY_KINDS = ['INCOME', 'EXPENSE', 'TRANSFER'];
+  const EXPENSE_HINT = /(?<![\p{L}])(beli|bayar|makan|mkn|minum|jajan|bensin|parkir|ongkos|belanja|tagihan|listrik|pulsa|cicilan|sewa|kopi|bakso|nasi|sarapan|ngopi|servis|service)(?![\p{L}])/u;
+  const memoryKind = (k) => { const t = String(k || '').trim().toUpperCase().replace(/[\s-]+/g, '_'); const v = ACTIVITY_TYPE_ALIASES[t] || t; return MEMORY_KINDS.includes(v) ? v : null; };
+  function memoryUsable(entry) {
+    if (!entry || typeof entry.term !== 'string') return false;
+    const t = entry.term.trim();
+    return t.length >= 3 && !!memoryKind(entry.kind);
+  }
+  /** Bersihkan Kamus tersimpan: normalkan jenis, buang kata kosong/terlalu pendek atau jenis tidak sah. */
+  function cleanMemory(list) {
+    const out = [];
+    (Array.isArray(list) ? list : []).forEach((m) => {
+      if (!m || typeof m.term !== 'string') return;
+      const kind = memoryKind(m.kind), term = m.term.trim();
+      if (!kind || term.length < 3) return;
+      out.push(Object.assign({}, m, { term, kind }));
+    });
+    return out;
+  }
+  function findLearned(memory, normalized) {
+    return [...(memory || [])].filter(memoryUsable).sort((a, b) => b.term.length - a.term.length)
+      .find((t) => wholeWord(normalized, normalizeText(t.term).trim()));
+  }
+
   const FreeTextParser = {
     normalize: normalizeText,
     parse(input, today, memory) {
@@ -238,10 +267,13 @@
       const original = (input || '').trim();
       const normalized = normalizeText(original);
       const amount = MoneyAmountParser.parse(normalized);
-      const learned = [...memory].sort((a, b) => b.term.length - a.term.length).find((t) => normalized.includes(normalizeText(t.term)));
+      let learned = findLearned(memory, normalized);
       const work = [...WORK_DAILY].sort(byLenDesc).find((w) => wholeWord(normalized, w));
       const freelance = [...WORK_FREELANCE].sort(byLenDesc).find((w) => wholeWord(normalized, w));
       const incomeWord = INCOME_WORDS.some((w) => wholeWord(normalized, w));
+      // Kamus tidak boleh mengubah kalimat pengeluaran yang jelas (beli, makan, bayar, ...) menjadi pemasukan.
+      if (learned && memoryKind(learned.kind) === 'INCOME' && EXPENSE_HINT.test(normalized) && !incomeWord && !work && !freelance) learned = null;
+      if (learned) learned = Object.assign({}, learned, { kind: memoryKind(learned.kind) });
       const moveIntent = /\b(pindah\s*dana|pindah\s*dompet|antar\s*dompet|transfer\s*antar|top\s*-?up|isi\s*saldo|tarik\s*tunai)\b/.test(normalized);
       const ambiguousTransfer = /\b(transfer|trf|trsf)\b/.test(normalized) && !moveIntent && !/\b(transfer\s*(masuk|dari|keluar|ke)|ditransfer\s*(masuk|dari|keluar|ke)|penerimaan\s*transfer)\b/.test(normalized);
       let kind, kindConfidence;
@@ -546,7 +578,7 @@
   }
 
   return {
-    MAX_AMOUNT, CAT, Profile, Reminder, MoneyAmountParser, FreeTextParser, WalletStoryParser, BillStoryParser, SlipMath, BalanceEngine, SummaryEngine, Reconcile, normalizeActivity, activityType, ledgerAmountValue,
+    MAX_AMOUNT, CAT, Profile, Reminder, MoneyAmountParser, FreeTextParser, WalletStoryParser, BillStoryParser, SlipMath, BalanceEngine, SummaryEngine, Reconcile, normalizeActivity, activityType, ledgerAmountValue, cleanMemory, memoryKind, memoryUsable, findLearned,
     rupiah, short, formatDate, monthLabel, todayISO, addDays, addMonths, daysBetween, monthOf, validDate, daysInMonth, iso, parts, validateAmount
   };
 });

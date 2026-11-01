@@ -5,7 +5,7 @@
   const R = KHRules, S = KHStore, { h, toast, modal, confirmBox, pinPad, moneyInput } = KHUI;
   const $app = document.getElementById('app');
   const db = () => S.db;
-  const VERSION = '1.0.7';
+  const VERSION = '1.0.8';
 
   // ---------- state ----------
   const session = { unlocked: false, email: null, flow: null };
@@ -682,7 +682,7 @@
         // Do not interrupt the recognized result with a two-choice confirmation dialog.
         if (r.kind === 'slip') { KHSlipUI.fromResult(r.res); return go('slipreview'); }
         const x = r;
-        entries.push(mkEntry(x.merchant || 'Struk', { kind: 'EXPENSE', amount: x.amount, category: x.category, merchant: x.merchant, note: 'Struk', date: x.date || R.todayISO() }, { source: 'struk', imageUrl: r.res.imageUrl, ocrText: (window.KHScan && r.res.words ? KHScan.groupLines(r.res.words).lines.map((l) => l.text).join('\n') : (r.res.words || []).map((w) => w.text).join(' ')), term: (x.merchant || '').toLowerCase(), advice: (r.res.advice || []).join(' '), amountSure: !!x.sure, dateGuess: !x.date, remember: x.category !== 'Belum pasti' ? false : true }));
+        entries.push(mkEntry(x.merchant || 'Struk', { kind: 'EXPENSE', amount: x.amount, category: R.CAT.expense.includes(x.category) ? x.category : 'Belum pasti', merchant: x.merchant, note: 'Struk', date: x.date || R.todayISO() }, { source: 'struk', imageUrl: r.res.imageUrl, ocrText: (window.KHScan && r.res.words ? KHScan.groupLines(r.res.words).lines.map((l) => l.text).join('\n') : (r.res.words || []).map((w) => w.text).join(' ')), term: (x.merchant || '').toLowerCase(), advice: (r.res.advice || []).join(' '), amountSure: !!x.sure, dateGuess: !x.date, remember: x.category !== 'Belum pasti' ? false : true }));
         const issues = []; if (!x.amount) issues.push('Nominal belum terbaca. Nominal sudah diisi otomatis bila terbaca; periksa atau isi sendiri.'); else if (!x.sure) issues.push('Nominal belum pasti. Cocokkan dengan foto, lalu ubah nominal bila perlu.');
         if (x.sure === false || !x.amount) (r.res.advice || []).forEach((t) => issues.push(t));
         if (issues.length) KHUI.notice(x.amount ? 'Periksa nominal' : 'Foto kurang jelas', h('div', null, issues.map((t) => h('p', null, t))), 'warn');
@@ -784,7 +784,9 @@
         const cardEl = h('section', { class: 'card entry', 'data-entry-index': i },
           h('div', { class: 'entry-head' }, h('small', null, e.raw), h('button', { class: 'btn ghost sm', onclick: () => { entries.splice(i, 1); entries.length ? drawPreview() : drawInput(); } }, 'Hapus')),
           e.imageUrl ? h('img', { class: 'slip-img', src: e.imageUrl, alt: 'Foto struk' }) : null,
-          directionField, amountField,
+          directionField,
+          h('p', { class: 'hint dir-note', 'data-dir-note': e.kind }, e.kind === 'EXPENSE' ? 'Pengeluaran: saldo dompet akan BERKURANG.' : e.kind === 'INCOME' ? 'Pemasukan: saldo dompet akan BERTAMBAH.' : e.kind === 'TRANSFER' ? 'Pindah dana: total saldo tidak berubah.' : ''),
+          amountField,
           categoryField,
           e.ocrText ? h('details', { class: 'ocr-text-details' }, h('summary', null, 'Lihat teks hasil baca'), h('textarea', { class: 'input', rows: 5, readOnly: true, value: e.ocrText })) : null,
           h('div', { class: e.kind === 'TRANSFER' ? 'two' : 'two' }, walletField, e.kind === 'TRANSFER' ? walletPairField : dateField),
@@ -798,8 +800,10 @@
     };
     function learn(e) {
       const t = e.term.trim().toLowerCase(), i = db().memory.findIndex((m) => m.term.toLowerCase() === t);
+      if (t.length < 3 || !R.memoryKind(e.kind)) return false;   // kata terlalu pendek atau jenis tidak sah tidak boleh masuk Kamus
       const rec = { id: i >= 0 ? db().memory[i].id : S.uid(), term: t, kind: e.kind, category: e.category, merchant: e.merchant, createdAt: Date.now() };
       if (i >= 0) db().memory[i] = rec; else db().memory.push(rec);
+      return true;
     }
     async function save() {
       const issue = getEntryIssue();
@@ -808,6 +812,7 @@
       if (!(await authorizeActivities(candidates))) return;
       const before = KHExtra.snapMonths(entries.map((e) => e.date)); let learned = 0;
       const beforeCount = db().activities.length, beforeMemory = db().memory.slice();
+      const balancesBefore = R.BalanceEngine.balances(db().wallets, liveActs());
       try {
         const order = entries.map((e, i) => ({ e, i })).sort((a, b) => {
           const monthOrder = R.monthOf(a.e.date).localeCompare(R.monthOf(b.e.date));
@@ -817,8 +822,16 @@
         });
         order.forEach(({ e, i }) => {
           addActivity({ ...candidates[i], budgetSavingsUsed: candidates[i].budgetSavingsUsed || 0 });
-          if (e.remember && e.term.trim() && e.category !== 'Belum pasti') { learn(e); learned++; }
+          if (e.remember && e.term.trim() && e.category !== 'Belum pasti' && learn(e)) learned++;
         });
+        // Penjaga arah saldo: total semua dompet harus berubah persis sebesar pemasukan dikurangi pengeluaran
+        // (pindah dana, termasuk dana tabungan yang dipindah otomatis, tidak mengubah total).
+        {
+          const sumAll = (m) => Object.values(m).reduce((n, v) => n + (Number(v) || 0), 0);
+          const delta = sumAll(R.BalanceEngine.balances(db().wallets, liveActs())) - sumAll(balancesBefore);
+          const expected = candidates.reduce((n, c) => { const v = Math.abs(R.ledgerAmountValue(c.amount)); return n + (c.type === 'INCOME' ? v : c.type === 'EXPENSE' ? -v : 0); }, 0);
+          if (Math.round(delta) !== Math.round(expected)) throw new Error('Arah saldo tidak sesuai jenis transaksi (Masuk menambah, Keluar mengurangi), jadi catatan dibatalkan. Periksa jenis transaksi lalu coba lagi.');
+        }
         if (!S.save()) throw new Error('Transaksi belum tersimpan ke penyimpanan perangkat. Periksa ruang penyimpanan, lalu coba lagi.');
         const bal = R.BalanceEngine.balances(db().wallets, liveActs()), one = entries.length === 1 && entries[0].kind !== 'TRANSFER' ? entries[0] : null;
         toast((entries.length > 1 ? `${entries.length} catatan tersimpan` : 'Tersimpan') + (one ? `. Saldo ${walletName(one.walletId)}: ${R.rupiah(Math.max(0, bal[one.walletId] || 0))}` : '') + (learned ? '. Kata diingat di Kamus saya.' : '')); KHExtra.notify(before); root('home');

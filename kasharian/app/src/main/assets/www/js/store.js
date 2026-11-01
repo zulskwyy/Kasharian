@@ -28,11 +28,18 @@
           migrated = true;
         }
       });
+      // Kamus saya: buang entri rusak (kata kosong/terlalu pendek, jenis tidak sah) yang bisa membalik arah transaksi.
+      if (root.KHRules && typeof root.KHRules.cleanMemory === 'function') {
+        const before = Array.isArray(loaded.memory) ? loaded.memory : [];
+        const cleaned = root.KHRules.cleanMemory(before);
+        if (cleaned.length !== before.length || cleaned.some((m, i) => m.kind !== before[i].kind || m.term !== before[i].term)) { loaded.memory = cleaned; migrated = true; }
+      }
       try { if (migrated) storage.setItem(KEY, JSON.stringify(loaded)); } catch (e) { /* keep the in-memory migration */ }
       return loaded;
     } catch (e) { return empty(); }
   }
-  function save() { try { storage.setItem(KEY, JSON.stringify(db)); return true; } catch (e) { return false; } }
+  // Bridge Android mengembalikan false bila penulisan gagal (tanpa melempar error); jangan dilaporkan sebagai sukses.
+  function save() { try { return storage.setItem(KEY, JSON.stringify(db)) !== false; } catch (e) { return false; } }
   function reset() { try { storage.removeItem(KEY); } catch (e) { /* ignore */ } db = empty(); }
   const uid = () => (root.crypto && crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
 
