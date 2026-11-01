@@ -5,7 +5,7 @@
   const R = KHRules, S = KHStore, { h, toast, modal, confirmBox, pinPad, moneyInput } = KHUI;
   const $app = document.getElementById('app');
   const db = () => S.db;
-  const VERSION = '1.0.1';
+  const VERSION = '1.0.7';
 
   // ---------- state ----------
   const session = { unlocked: false, email: null, flow: null };
@@ -91,7 +91,7 @@
 
   // ---------- data helpers ----------
   const activeWallets = () => db().wallets.filter((w) => !w.archived);
-  const liveActs = () => db().activities.filter((a) => !a.deletedAt);
+  const liveActs = () => db().activities.filter((a) => !a.deletedAt).map((a) => Object.assign(a, R.normalizeActivity(a)));
   const sortedActs = () => liveActs().slice().sort((a, b) => (a.occurredOn === b.occurredOn ? b.createdAt - a.createdAt : a.occurredOn < b.occurredOn ? 1 : -1));
   const WALLET_ORDER = { BANK: 0, EWALLET: 1, OTHER: 2, SAVINGS: 3, EMERGENCY: 4, CASH: 5 };
   const isCashWallet = (w) => w.type === 'CASH' || /^(tunai|kas|cash)(\s|$)/i.test(w.name || '');
@@ -125,7 +125,7 @@
     if (rec.type !== 'EXPENSE' || authSav + authFree <= 0 || Number(rec.budgetSavingsTransferred) >= authSav + authFree) return;
     const balances = R.BalanceEngine.balances(db().wallets, liveActs());
     const walletAvailable = Math.max(0, Number(balances[rec.walletId]) || 0);
-    const shortfall = Math.max(0, Number(rec.amount) - walletAvailable);
+    const shortfall = Math.max(0, R.ledgerAmountValue(rec.amount) - walletAvailable);
     if (shortfall > authSav + authFree) throw new Error(`Saldo dompet ${walletName(rec.walletId)} kurang ${R.rupiah(shortfall - authSav - authFree)} di luar dana yang Anda setujui. Pilih dompet dengan saldo cukup atau catat pemasukan terlebih dahulu.`);
     const pos = (w) => Math.max(0, Number(balances[w.id]) || 0);
     const freeSources = db().wallets.filter((w) => !w.archived && w.type !== 'SAVINGS' && w.type !== 'EMERGENCY' && w.id !== rec.walletId).sort((x, y) => pos(y) - pos(x)).map((w) => ({ wallet: w, available: pos(w) }));
@@ -153,14 +153,21 @@
   }
 
   function addActivity(a) {
-    const err = R.validateAmount(a.amount);
+    const rec = Object.assign({ id: S.uid(), type: 'EXPENSE', walletId: defaultWallet().id, toWalletId: null, category: 'Lainnya', occurredOn: R.todayISO(), merchant: null, note: '', source: 'manual', sourceId: null, createdAt: Date.now(), updatedAt: Date.now(), deletedAt: null }, a || {});
+    Object.assign(rec, R.normalizeActivity(rec));
+    if (!['INCOME', 'EXPENSE', 'TRANSFER', 'ADJUSTMENT'].includes(rec.type)) throw new Error('Jenis transaksi tidak valid. Pilih Masuk, Keluar, Pindah dana, atau Penyesuaian.');
+    // Amounts for income/expense/transfer are always positive magnitudes; type alone
+    // controls whether the ledger adds or subtracts. Adjustments remain signed.
+    rec.amount = rec.type === 'ADJUSTMENT' ? Math.round(R.ledgerAmountValue(rec.amount)) : Math.round(Math.abs(R.ledgerAmountValue(rec.amount)));
+    if (!Number.isSafeInteger(rec.amount)) throw new Error('Nominal transaksi tidak valid. Periksa kembali angka yang dimasukkan.');
+    const err = R.validateAmount(Math.abs(rec.amount));
     if (err) throw new Error(err);
-    const rec = Object.assign({ id: S.uid(), type: 'EXPENSE', walletId: defaultWallet().id, toWalletId: null, category: 'Lainnya', occurredOn: R.todayISO(), merchant: null, note: '', source: 'manual', sourceId: null, createdAt: Date.now(), updatedAt: Date.now(), deletedAt: null }, a);
     // Snapshot the allocation rules at the time an income is recorded so future
     // plan changes never rewrite the history of savings goals.
     if (rec.type === 'INCOME' && !rec.planAllocation && window.KHExtra && typeof KHExtra.allocationSnapshot === 'function') {
       rec.planAllocation = KHExtra.allocationSnapshot(rec.amount, rec.category);
     }
+    if (!activeWallets().some((w) => w.id === rec.walletId)) throw new Error('Pilih dompet aktif untuk transaksi ini.');
     // Transfers must always have an explicit source and destination. A transfer
     // without two wallets is not a valid ledger event and must never become income.
     if (rec.type === 'TRANSFER') {
@@ -186,7 +193,7 @@
     if (rec.type === 'EXPENSE' && (Number(rec.budgetSavingsUsed || 0) + Number(rec.budgetFreeUsed || 0) + Number(rec.budgetTopUp || 0)) > Number(rec.budgetSavingsTransferred || 0)) fundSavingsOverage(rec);
     const balances = R.BalanceEngine.balances(db().wallets, liveActs());
     const available = Math.max(0, Number(balances[rec.walletId]) || 0);
-    const amount = Math.max(0, Number(rec.amount) || 0);
+    const amount = Math.max(0, R.ledgerAmountValue(rec.amount));
     if ((rec.type === 'EXPENSE' || rec.type === 'TRANSFER') && amount > available) throw new Error(`Saldo dompet ${walletName(rec.walletId)} hanya ${R.rupiah(available)}. Tambahkan pemasukan atau pilih dompet yang memiliki saldo cukup sebelum menyimpan transaksi.`);
     db().activities.push(rec);
     return rec;
@@ -208,7 +215,7 @@
     for (const x of projectionOrder) {
       if (!x.walletId) continue; // a new wallet may be created by the import handler
       if (!(x.walletId in projected)) projected[x.walletId] = Number(currentBalances[x.walletId]) || 0;
-      const amount = Math.max(0, Number(x.amount) || 0);
+      const amount = Math.abs(R.ledgerAmountValue(x.amount));
       if (x.type === 'INCOME') projected[x.walletId] += amount;
       else {
         const available = Math.max(0, projected[x.walletId]);
@@ -226,7 +233,7 @@
       // Include income entries in this same unsaved batch in the projected limit.
       // The ledger itself is not mutated until every item passes authorization.
       const pendingIncomeLimit = all.filter((x) => x.type === 'INCOME' && R.monthOf(x.occurredOn || R.todayISO()) === ym)
-        .reduce((n, x) => n + (typeof KHExtra.spendingLimitForIncome === 'function' ? KHExtra.spendingLimitForIncome(x.amount, x.category) : 0), 0);
+        .reduce((n, x) => n + (typeof KHExtra.spendingLimitForIncome === 'function' ? KHExtra.spendingLimitForIncome(Math.abs(R.ledgerAmountValue(x.amount)), x.category) : 0), 0);
       const spendable = Math.max(0, s.spendable + pendingIncomeLimit);
       if (projectedSavingsAvailable === null) projectedSavingsAvailable = s.savingsAvailable;
       projectedSavingsAvailable = Math.min(projectedSavingsAvailable, s.savingsAvailable);
@@ -241,7 +248,7 @@
         }
         return false;
       }
-      const total = regular.reduce((n, x) => n + Math.max(0, Number(x.amount) || 0), 0);
+      const total = regular.reduce((n, x) => n + Math.abs(R.ledgerAmountValue(x.amount)), 0);
       const excess = Math.max(0, total - spendable);
       if (excess > 0) {
         if (!ladderState) ladderState = ladderAvailability(s);
@@ -270,7 +277,7 @@
         const goals = ((window.KHExtra && KHExtra.plan().buckets) || []).filter((b) => b.save), availableByGoal = { ...(s.savingsByBucket || {}) };
         let remaining = spendable;
         for (const x of regular) {
-          const amt = Math.max(0, Number(x.amount) || 0), fromLimit = Math.min(remaining, amt); remaining -= fromLimit;
+          const amt = Math.abs(R.ledgerAmountValue(x.amount)), fromLimit = Math.min(remaining, amt); remaining -= fromLimit;
           let portion = amt - fromLimit; const kinds = new Set();
           x.budgetSavingsUsed = 0; x.budgetFreeUsed = 0; x.budgetSavingsByBucket = {};
           for (const k of order) {
@@ -308,7 +315,7 @@
       if (unfunded.length) {
         const x = unfunded[0];
         await modal({ title: 'Saldo dompet tidak cukup', tone: 'warn', body: [
-          h('p', null, `${walletName(x.item.walletId)} memiliki ${R.rupiah(x.available)}, transaksi ${R.rupiah(Math.max(0, Number(x.item.amount) || 0))}.`),
+          h('p', null, `${walletName(x.item.walletId)} memiliki ${R.rupiah(x.available)}, transaksi ${R.rupiah(Math.max(0, R.ledgerAmountValue(x.item.amount)))}.`),
           h('p', null, 'Pilih dompet dengan saldo cukup atau catat pemasukan terlebih dahulu.')], buttons: [{ label: 'Kembali', kind: 'primary', value: false }] });
         return false;
       }
@@ -597,7 +604,7 @@
     const meta = a.type === 'TRANSFER' ? `${walletName(a.walletId)} \u2192 ${walletName(a.toWalletId)}` : [a.category, nature].filter(Boolean).join(' \u00b7 ');
     return h('button', { class: 'act', onclick: () => go('editact', { id: a.id }) },
       h('span', { class: 'act-main' }, h('strong', null, title), h('small', null, meta)),
-      h('span', { class: 'act-side' }, h('span', { class: 'amt ' + (s > 0 ? 'in' : s < 0 ? 'out' : 'mv') }, (s > 0 ? '+' : s < 0 ? '-' : '') + R.rupiah(Math.abs(a.amount))), a.type === 'TRANSFER' ? null : h('small', null, walletName(a.walletId))));
+      h('span', { class: 'act-side' }, h('span', { class: 'amt ' + (s > 0 ? 'in' : s < 0 ? 'out' : 'mv') }, (s > 0 ? '+' : s < 0 ? '-' : '') + R.rupiah(Math.abs(R.ledgerAmountValue(a.amount)))), a.type === 'TRANSFER' ? null : h('small', null, walletName(a.walletId))));
   };
 
   let homeView = 'ALL';                                   // 'ALL' = gabungan semua dompet (seperti satu rekening); atau id dompet
@@ -671,18 +678,22 @@
       try {
         const r = await scanWith(files, (cb) => KHExtra.readDoc(files, cb)); if (!r) return;
         if (r.kind === 'statement') { KHExtra.openStatement(r); return go('statement'); }
-        if (r.kind === 'slip' && await confirmBox('Ini slip gaji?', 'Isinya terlihat seperti slip gaji. Buka pembaca slip agar gaji dan potongan dicatat rapi?', 'Buka pembaca slip', 'Catat sebagai struk')) { KHSlipUI.fromResult(r.res); return go('slipreview'); }
-        const x = r.kind === 'slip' ? { amount: 0, merchant: null, category: 'Belum pasti', date: null } : r;
-        entries.push(mkEntry(x.merchant || 'Struk', { kind: 'EXPENSE', amount: x.amount, category: x.category, merchant: x.merchant, note: 'Struk', date: x.date || R.todayISO() }, { source: 'struk', imageUrl: r.res.imageUrl, ocrText: (window.KHScan && r.res.words ? KHScan.groupLines(r.res.words).lines.map((l) => l.text).join('\n') : (r.res.words || []).map((w) => w.text).join(' ')), term: (x.merchant || '').toLowerCase(), choices: x.choices || [], advice: (r.res.advice || []).join(' '), amountSure: !!x.sure, dateGuess: !x.date, remember: x.category !== 'Belum pasti' ? false : true }));
-        const issues = []; if (!x.amount) issues.push('Nominal belum terbaca. Pilih angka di bawah foto atau isi sendiri.'); else if (!x.sure) issues.push('Nominal belum pasti. Cocokkan dengan foto, lalu ketuk angka yang benar.');
+        // OCR-classified salary slips go directly to the populated salary review.
+        // Do not interrupt the recognized result with a two-choice confirmation dialog.
+        if (r.kind === 'slip') { KHSlipUI.fromResult(r.res); return go('slipreview'); }
+        const x = r;
+        entries.push(mkEntry(x.merchant || 'Struk', { kind: 'EXPENSE', amount: x.amount, category: x.category, merchant: x.merchant, note: 'Struk', date: x.date || R.todayISO() }, { source: 'struk', imageUrl: r.res.imageUrl, ocrText: (window.KHScan && r.res.words ? KHScan.groupLines(r.res.words).lines.map((l) => l.text).join('\n') : (r.res.words || []).map((w) => w.text).join(' ')), term: (x.merchant || '').toLowerCase(), advice: (r.res.advice || []).join(' '), amountSure: !!x.sure, dateGuess: !x.date, remember: x.category !== 'Belum pasti' ? false : true }));
+        const issues = []; if (!x.amount) issues.push('Nominal belum terbaca. Nominal sudah diisi otomatis bila terbaca; periksa atau isi sendiri.'); else if (!x.sure) issues.push('Nominal belum pasti. Cocokkan dengan foto, lalu ubah nominal bila perlu.');
         if (x.sure === false || !x.amount) (r.res.advice || []).forEach((t) => issues.push(t));
-        if (issues.length) KHUI.notice(x.amount ? 'Periksa nominal' : 'Foto kurang jelas', h('div', null, issues.map((t) => h('p', null, t))), 'warn'); else toast('Struk terbaca');
+        if (issues.length) KHUI.notice(x.amount ? 'Periksa nominal' : 'Foto kurang jelas', h('div', null, issues.map((t) => h('p', null, t))), 'warn');
         drawPreview();
+        if (!issues.length) toast('Hasil OCR sudah diisi. Periksa catatan lalu tekan Simpan catatan.');
       } catch (e) {
         const act = await KHUI.notice('Scan belum berhasil', h('p', null, (e && e.message) || 'Berkas tidak bisa dibaca.'), 'error', [{ label: 'Isi manual', kind: 'ghost', value: 'manual' }, { label: 'Coba lagi', kind: 'primary', value: 'retry' }]);
         if (act === 'retry') return onFiles(files);
       }
     }
+    /** OCR mengisi pratinjau secara otomatis; pengguna tetap memeriksa dan menyimpan melalui tombol utama. */
     const attachCard = () => card(h('h3', null, 'Kirim foto atau dokumen'), null, KHExtra.attachButtons(onFiles, { cam: 'Foto struk' }), ast);
     const examples = ['mkn siang 25rb', 'bensin 30rb kemarin', 'gaji masuk 5jt', 'ngojek 120rb'];
     const drawInput = () => {
@@ -774,7 +785,6 @@
           h('div', { class: 'entry-head' }, h('small', null, e.raw), h('button', { class: 'btn ghost sm', onclick: () => { entries.splice(i, 1); entries.length ? drawPreview() : drawInput(); } }, 'Hapus')),
           e.imageUrl ? h('img', { class: 'slip-img', src: e.imageUrl, alt: 'Foto struk' }) : null,
           directionField, amountField,
-          e.choices && e.choices.length ? h('div', { class: 'field amount-choices', 'data-field': 'amount' }, h('div', { class: 'chips' }, e.choices.map((n) => h('button', { type: 'button', class: 'chip' + (e.amount === n ? ' on' : ''), onclick: () => { e.amount = n; drawPreview(); } }, R.rupiah(n))))) : null,
           categoryField,
           e.ocrText ? h('details', { class: 'ocr-text-details' }, h('summary', null, 'Lihat teks hasil baca'), h('textarea', { class: 'input', rows: 5, readOnly: true, value: e.ocrText })) : null,
           h('div', { class: e.kind === 'TRANSFER' ? 'two' : 'two' }, walletField, e.kind === 'TRANSFER' ? walletPairField : dateField),
@@ -783,7 +793,7 @@
           field('Catatan', h('input', { class: 'input', value: [e.merchant, e.note].filter(Boolean).join(' ').trim(), oninput: (ev) => { e.note = ev.target.value; e.merchant = null; } })), rem);
         return cardEl;
       });
-      box.replaceChildren(...cards, attachCard(), status, saveBtn, h('button', { class: 'btn ghost block', onclick: drawInput }, 'Ubah cerita'));
+      box.replaceChildren(...cards, attachCard(), h('div', { class: 'save-bar' }, status, saveBtn), h('button', { class: 'btn ghost block', onclick: drawInput }, 'Ubah cerita'));
       check();
     };
     function learn(e) {
@@ -809,8 +819,10 @@
           addActivity({ ...candidates[i], budgetSavingsUsed: candidates[i].budgetSavingsUsed || 0 });
           if (e.remember && e.term.trim() && e.category !== 'Belum pasti') { learn(e); learned++; }
         });
-        S.save(); toast((entries.length > 1 ? `${entries.length} catatan tersimpan` : 'Tersimpan') + (learned ? '. Kata diingat di Kamus saya.' : '')); KHExtra.notify(before); root('home');
-      } catch (err) { db().activities.splice(beforeCount); db().memory = beforeMemory; S.save(); toast(err.message); }
+        if (!S.save()) throw new Error('Transaksi belum tersimpan ke penyimpanan perangkat. Periksa ruang penyimpanan, lalu coba lagi.');
+        const bal = R.BalanceEngine.balances(db().wallets, liveActs()), one = entries.length === 1 && entries[0].kind !== 'TRANSFER' ? entries[0] : null;
+        toast((entries.length > 1 ? `${entries.length} catatan tersimpan` : 'Tersimpan') + (one ? `. Saldo ${walletName(one.walletId)}: ${R.rupiah(Math.max(0, bal[one.walletId] || 0))}` : '') + (learned ? '. Kata diingat di Kamus saya.' : '')); KHExtra.notify(before); root('home');
+      } catch (err) { db().activities.splice(beforeCount); db().memory = beforeMemory; S.save(); KHUI.notice('Catatan belum tersimpan', h('p', null, err.message), 'error'); }
     }
     drawInput();
     return frame({ title: 'Catat', back: true, children: [box] });
@@ -823,8 +835,8 @@
     activities.filter((a) => R.monthOf(a.occurredOn) === ym && (a.type === 'INCOME' || a.type === 'EXPENSE')) .forEach((a) => {
       const day = Number(String(a.occurredOn).slice(8, 10)) - 1;
       if (day < 0 || day >= days) return;
-      if (a.type === 'INCOME') income[day] += Math.max(0, Number(a.amount) || 0);
-      else expense[day] += Math.max(0, Number(a.amount) || 0);
+      if (a.type === 'INCOME') income[day] += Math.abs(R.ledgerAmountValue(a.amount));
+      else expense[day] += Math.abs(R.ledgerAmountValue(a.amount));
     });
     const sumIn = income.reduce((a, b) => a + b, 0), sumOut = expense.reduce((a, b) => a + b, 0);
     if (!sumIn && !sumOut) return card(h('h3', null, 'Arus uang harian'), null);
@@ -888,7 +900,7 @@
   SCREENS.editact = ({ id }) => {
     const a = db().activities.find((x) => x.id === id);
     if (!a) return frame({ title: 'Aktivitas', back: true, children: [h('p', { class: 'empty' }, 'Aktivitas tidak ditemukan.')] });
-    const f = { amount: Math.abs(a.amount), category: a.category, walletId: a.walletId, date: a.occurredOn, merchant: a.merchant || '', note: a.note || '', kind: a.type };
+    const f = { amount: Math.abs(R.ledgerAmountValue(a.amount)), category: a.category, walletId: a.walletId, date: a.occurredOn, merchant: a.merchant || '', note: a.note || '', kind: a.type };
     const err = errBox();
     const simple = a.type === 'INCOME' || a.type === 'EXPENSE';
     f.bucket = a.bucket || 'auto';
@@ -937,13 +949,15 @@
             if (f.bucket === 'auto') delete a.bucket; else { a.bucket = f.bucket; if (window.KHBucket) KHBucket.learn(db(), { merchant: f.merchant, note: f.note }, f.bucket); }
           }
           Object.assign(a, { walletId: f.walletId, occurredOn: f.date, merchant: f.merchant || null, note: f.note, updatedAt: Date.now() });
+          Object.assign(a, R.normalizeActivity(a));
           if (candidate && (Number(candidate.budgetSavingsUsed) > 0 || Number(candidate.budgetFreeUsed) > 0 || Number(candidate.budgetTopUp) > 0)) {
             const funding = { ...candidate, id: a.id };
             fundSavingsOverage(funding);
             a.budgetSavingsTransferred = funding.budgetSavingsTransferred || 0;
           }
           a.deletedAt = oldDeletedAt;
-          S.save(); toast('Perubahan disimpan'); back();
+          if (!S.save()) throw new Error('Perubahan belum tersimpan ke perangkat.');
+          toast('Perubahan disimpan'); back();
         } catch (e) {
           // Make the edit atomic if funding fails: discard newly-created transfers,
           // restore the original activity, and put back its former funding entries.
@@ -978,7 +992,6 @@
       prev.replaceChildren(...[...drafts.map((d, i) => h('section', { class: 'card entry' },
         field('Nama tagihan', h('input', { class: 'input', value: d.name, oninput: (e) => { d.name = e.target.value; } })),
         field('Nominal', moneyInput(d.amount || 0, (n) => { d.amount = n; })),
-        d.choices && d.choices.length ? h('div', { class: 'chips' }, d.choices.map((n) => h('button', { class: 'chip' + (d.amount === n ? ' on' : ''), onclick: () => { d.amount = n; drawDrafts(); } }, R.rupiah(n)))) : null,
         h('div', { class: 'two' }, field('Jatuh tempo', h('input', { class: 'input', type: 'date', value: d.dueOn, onchange: (e) => { d.dueOn = e.target.value || d.dueOn; } })),
           field('Ulang', h('select', { class: 'input', onchange: (e) => { d.recurrence = e.target.value; } }, [['NONE', 'Sekali'], ['MONTHLY', 'Tiap bulan']].map(([v, l]) => h('option', { value: v, selected: d.recurrence === v }, l))))),
         h('button', { class: 'btn ghost sm', onclick: () => { drafts.splice(i, 1); drawDrafts(); } }, 'Hapus')),

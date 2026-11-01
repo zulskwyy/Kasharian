@@ -382,17 +382,65 @@
   };
 
   // ---------- balances and summaries ----------
+  const ACTIVITY_TYPE_ALIASES = {
+    IN: 'INCOME', MASUK: 'INCOME', PEMASUKAN: 'INCOME', INCOMING: 'INCOME', CREDIT: 'INCOME', DEPOSIT: 'INCOME',
+    OUT: 'EXPENSE', KELUAR: 'EXPENSE', PENGELUARAN: 'EXPENSE', OUTGOING: 'EXPENSE', SPEND: 'EXPENSE', SPENDING: 'EXPENSE', DEBIT: 'EXPENSE', PAYMENT: 'EXPENSE',
+    MOVE: 'TRANSFER', PINDAH: 'TRANSFER', PINDAH_DANA: 'TRANSFER', INTERNAL_TRANSFER: 'TRANSFER'
+  };
+  const activityType = (a) => {
+    const t = String((a && (a.type || a.kind)) || '').trim().toUpperCase().replace(/[\s-]+/g, '_');
+    return ACTIVITY_TYPE_ALIASES[t] || t;
+  };
+  /** Read both numeric values and legacy rupiah strings without treating `25.000` as 25. */
+  function ledgerAmountValue(value) {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+    if (value == null) return 0;
+    let s = String(value).trim().replace(/^(?:rp\.?|idr)\s*/i, '').replace(/\s/g, '');
+    if (!s) return 0;
+    const negative = /^-/.test(s) || /\(.*\)/.test(s);
+    s = s.replace(/[()\-+]/g, '').replace(/[^0-9.,]/g, '');
+    if (!s || !/\d/.test(s)) return 0;
+    const dot = s.lastIndexOf('.'), comma = s.lastIndexOf(',');
+    if (dot >= 0 && comma >= 0) {
+      const decimal = dot > comma ? '.' : ',';
+      const thousands = decimal === '.' ? ',' : '.';
+      const tail = s.slice(s.lastIndexOf(decimal) + 1);
+      s = tail.length === 3 ? s.replace(/[.,]/g, '') : s.split(thousands).join('').replace(decimal, '.');
+    } else if (dot >= 0 || comma >= 0) {
+      const sep = dot >= 0 ? '.' : ',', parts = s.split(sep);
+      if (parts.length > 2 || (parts.length === 2 && parts[1].length === 3 && parts[0].length <= 3)) s = parts.join('');
+      else if (parts.length === 2) s = parts[0] + '.' + parts[1];
+    }
+    const n = Number(s);
+    if (!Number.isFinite(n)) return 0;
+    const integer = Math.round(Math.abs(n));
+    return negative ? -integer : integer;
+  }
+  const ledgerMagnitude = (a) => Math.abs(ledgerAmountValue(a && a.amount));
+  /** Canonical ledger record: direction is encoded only by type, never by the amount sign. */
+  function normalizeActivity(a) {
+    if (!a || typeof a !== 'object') return a;
+    const type = activityType(a), raw = ledgerAmountValue(a.amount);
+    const amount = type === 'ADJUSTMENT' ? raw : Math.abs(raw);
+    return Object.assign({}, a, { type, amount });
+  }
   const BalanceEngine = {
+    normalizeActivity,
     balances(wallets, acts) {
       const res = {};
-      wallets.forEach((w) => { res[w.id] = w.openingBalance || 0; });
-      for (const a of acts) {
-        if (a.deletedAt) continue;
-        if (a.type === 'INCOME' || a.type === 'ADJUSTMENT') res[a.walletId] = (res[a.walletId] || 0) + a.amount;
-        else if (a.type === 'EXPENSE') res[a.walletId] = (res[a.walletId] || 0) - a.amount;
-        else if (a.type === 'TRANSFER') {
-          res[a.walletId] = (res[a.walletId] || 0) - a.amount;
-          if (a.toWalletId) res[a.toWalletId] = (res[a.toWalletId] || 0) + a.amount;
+      wallets.forEach((w) => { res[w.id] = ledgerAmountValue(w.openingBalance); });
+      for (const source of acts || []) {
+        if (!source || source.deletedAt) continue;
+        const a = normalizeActivity(source), type = a.type, amount = ledgerMagnitude(a), wid = a.walletId;
+        if (!wid) continue;
+        if (type === 'INCOME') res[wid] = (res[wid] || 0) + amount;
+        else if (type === 'EXPENSE') res[wid] = (res[wid] || 0) - amount;
+        else if (type === 'ADJUSTMENT') res[wid] = (res[wid] || 0) + ledgerAmountValue(a.amount);
+        else if (type === 'TRANSFER') {
+          // A transfer must have two distinct wallets. An incomplete transfer must never alter any balance.
+          if (!a.toWalletId || a.toWalletId === wid) continue;
+          res[wid] = (res[wid] || 0) - amount;
+          res[a.toWalletId] = (res[a.toWalletId] || 0) + amount;
         }
       }
       return res;
@@ -405,22 +453,22 @@
 
   const SummaryEngine = {
     month(acts, ym) {
-      const rec = acts.filter((a) => !a.deletedAt && monthOf(a.occurredOn) === ym && (a.type === 'INCOME' || a.type === 'EXPENSE'));
-      const income = sum(rec.filter((a) => a.type === 'INCOME'));
+      const rec = acts.filter((a) => !a.deletedAt && monthOf(a.occurredOn) === ym).map(normalizeActivity).filter((a) => a.type === 'INCOME' || a.type === 'EXPENSE');
+      const income = rec.filter((a) => a.type === 'INCOME').reduce((n, a) => n + ledgerMagnitude(a), 0);
       const exp = rec.filter((a) => a.type === 'EXPENSE');
-      const expense = sum(exp);
+      const expense = exp.reduce((n, a) => n + ledgerMagnitude(a), 0);
       const byCat = {};
-      exp.forEach((a) => { byCat[a.category] = (byCat[a.category] || 0) + a.amount; });
+      exp.forEach((a) => { byCat[a.category] = (byCat[a.category] || 0) + ledgerMagnitude(a); });
       const top = Object.entries(byCat).sort((a, b) => b[1] - a[1])[0];
-      return { income, expense, difference: income - expense, biggestCategory: top ? top[0] : null, biggestExpense: exp.reduce((m, a) => Math.max(m, a.amount), 0) };
+      return { income, expense, difference: income - expense, biggestCategory: top ? top[0] : null, biggestExpense: exp.reduce((m, a) => Math.max(m, ledgerMagnitude(a)), 0) };
     },
     /** Category shares exclude payroll deductions (they are not spending choices); month totals include them. */
     categoryBreakdown(acts, ym) {
       const prevYm = addMonths(ym, -1);
       const pick = (m) => {
         const r = {};
-        acts.filter((a) => !a.deletedAt && a.type === 'EXPENSE' && a.category !== 'Potongan gaji' && monthOf(a.occurredOn) === m)
-          .forEach((a) => { r[a.category] = (r[a.category] || 0) + a.amount; });
+        acts.filter((a) => !a.deletedAt && activityType(a) === 'EXPENSE' && a.category !== 'Potongan gaji' && monthOf(a.occurredOn) === m)
+          .forEach((a) => { r[a.category] = (r[a.category] || 0) + ledgerMagnitude(a); });
         return r;
       };
       const cur = pick(ym), prev = pick(prevYm);
@@ -498,7 +546,7 @@
   }
 
   return {
-    MAX_AMOUNT, CAT, Profile, Reminder, MoneyAmountParser, FreeTextParser, WalletStoryParser, BillStoryParser, SlipMath, BalanceEngine, SummaryEngine, Reconcile,
+    MAX_AMOUNT, CAT, Profile, Reminder, MoneyAmountParser, FreeTextParser, WalletStoryParser, BillStoryParser, SlipMath, BalanceEngine, SummaryEngine, Reconcile, normalizeActivity, activityType, ledgerAmountValue,
     rupiah, short, formatDate, monthLabel, todayISO, addDays, addMonths, daysBetween, monthOf, validDate, daysInMonth, iso, parts, validateAmount
   };
 });

@@ -16,8 +16,8 @@ android {
         applicationId = "id.kasharian.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 102
-        versionName = "1.0.2"
+        versionCode = 107
+        versionName = "1.0.7"
         vectorDrawables.useSupportLibrary = true
     }
 

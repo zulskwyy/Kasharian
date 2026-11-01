@@ -141,9 +141,16 @@
       const title = `Gaji ${d.period ? R.monthLabel(d.period) : R.formatDate(d.date)}`;
       try {
         slip.activityIds.push(A.addActivity({ type: 'INCOME', amount: i.net, walletId: d.walletId, category: 'Gaji', occurredOn: d.date, merchant: d.employer, note: title + ' (bersih)', source: 'slip', sourceId: slip.id }).id);
-      } catch (e) { return toast(e.message); }
-      db().slips.push(slip); S.save(); draft = null;
-      toast('Gaji dicatat'); root('home');
+        db().slips.push(slip);
+        if (!S.save()) throw new Error('Slip belum tersimpan ke penyimpanan perangkat. Coba lagi.');
+      } catch (e) {
+        db().activities = db().activities.filter((a) => !slip.activityIds.includes(a.id));
+        db().slips = db().slips.filter((x) => x.id !== slip.id);
+        S.save();
+        return toast(e.message);
+      }
+      draft = null;
+      toast('Gaji dicatat dan saldo diperbarui'); root('home');
     }
 
     drawRows(); drawNet();

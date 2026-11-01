@@ -239,12 +239,23 @@
       for (const o of opts) { cur[i] = o; rec(i + 1, g + (o === 'EARNING' ? amt : 0), d + (o === 'DEDUCTION' ? amt : 0)); }
     })(0, baseG, baseD);
     if (!sols.length) return null;
-    // prefer the solution closest to the dictionary guess, and with the fewest INFO rows
-    const score = (s) => s.reduce((acc, t, i) => acc + (t === 'INFO' ? 1 : 0) + (rows[idxWeak[i]].type !== 'UNCLASSIFIED' && rows[idxWeak[i]].type !== t ? 2 : 0), 0);
+    // Prefer the dictionary/column guess, avoid INFO, and use Indonesian payroll
+    // vocabulary as a semantic tie-breaker. Even when two solutions reconcile to
+    // the same net salary, return one deterministic best-fit assignment so the
+    // review form is prefilled instead of forcing a manual choice.
+    const earningWords = /gaji|upah|tunjangan|bonus|lembur|insentif|komisi|premi|transport|makan|jabatan|thr|honor|pendapatan|penghasilan/i;
+    const deductionWords = /potongan|bpjs|pph|ppn|pajak|iuran|pinjaman|angsuran|kasbon|koperasi|denda|terlambat|absen|asuransi|jht|jkn/i;
+    const score = (s) => s.reduce((acc, t, i) => {
+      const row = rows[idxWeak[i]], label = String(row.label || '');
+      const semantic = deductionWords.test(label) ? 'DEDUCTION' : earningWords.test(label) ? 'EARNING' : null;
+      return acc + (t === 'INFO' ? 1 : 0)
+        + (row.type !== 'UNCLASSIFIED' && row.type !== t ? 2 : 0)
+        + (semantic && semantic !== t ? 5 : 0);
+    }, 0);
     sols.sort((a, b) => score(a) - score(b));
     const best = sols[0];
     const tied = sols.filter((s) => score(s) === score(best)).length;
-    return { idxWeak, types: best, unique: tied === 1, count: sols.length };
+    return { idxWeak, types: best, unique: tied === 1, ambiguous: tied > 1, count: sols.length };
   }
 
   function analyze(res) {
@@ -280,11 +291,11 @@
       const sol = solveWeakRows(rows, target);
       const before = SlipMath.totals(rows).net;
       if (sol && (before !== target.net)) {
-        if (sol.unique) {
-          sol.idxWeak.forEach((ri, k) => { rows[ri].type = sol.types[k]; rows[ri].weak = false; rows[ri].source = 'cocok dengan gaji bersih'; });
-          solved = true;
-          notes.push('Jenis beberapa baris diatur otomatis agar hitungan sama dengan gaji bersih di slip. Mohon periksa.');
-        } else notes.push('Ada beberapa kemungkinan pengaturan baris yang cocok dengan gaji bersih. Pilih jenis baris secara manual.');
+        sol.idxWeak.forEach((ri, k) => { rows[ri].type = sol.types[k]; rows[ri].weak = false; rows[ri].source = 'cocok dengan gaji bersih'; });
+        solved = true;
+        notes.push(sol.ambiguous
+          ? 'Jenis baris yang belum jelas dipilih otomatis dari kecocokan gaji bersih dan nama baris. Periksa kembali bila diperlukan.'
+          : 'Jenis beberapa baris diatur otomatis agar hitungan sama dengan gaji bersih di slip.');
       }
     }
 

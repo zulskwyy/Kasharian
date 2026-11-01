@@ -13,7 +13,22 @@
       const raw = storage.getItem(KEY); if (!raw) return empty();
       const loaded = Object.assign(empty(), JSON.parse(raw));
       delete loaded.recovery; delete loaded.recFailed; loaded.v = 3;
-      try { storage.setItem(KEY, JSON.stringify(loaded)); } catch (e) { /* keep the in-memory migration */ }
+
+      // One canonical ledger format is used at load, calculation, and write time.
+      // This also repairs older Android records where rupiah was stored as text.
+      let migrated = false;
+      if (!Array.isArray(loaded.activities)) loaded.activities = [];
+      loaded.activities.forEach((a) => {
+        if (!a || typeof a !== 'object') return;
+        const normalized = root.KHRules && typeof root.KHRules.normalizeActivity === 'function'
+          ? root.KHRules.normalizeActivity(a) : a;
+        if (!normalized) return;
+        if (normalized.type !== a.type || normalized.amount !== a.amount) {
+          Object.assign(a, { type: normalized.type, amount: normalized.amount });
+          migrated = true;
+        }
+      });
+      try { if (migrated) storage.setItem(KEY, JSON.stringify(loaded)); } catch (e) { /* keep the in-memory migration */ }
       return loaded;
     } catch (e) { return empty(); }
   }

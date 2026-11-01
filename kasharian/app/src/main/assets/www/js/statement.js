@@ -22,24 +22,27 @@
     wallets.forEach((w) => { byId[w.id] = w; });
     const acts = (o.acts || []).filter((a) => !a.deletedAt).slice().sort((a, b) => (a.occurredOn < b.occurredOn ? -1 : a.occurredOn > b.occurredOn ? 1 : (a.createdAt || 0) - (b.createdAt || 0)));
     const delta = (a) => {
-      if (a.type === 'INCOME' || a.type === 'ADJUSTMENT') return ids.has(a.walletId) ? a.amount : 0;
-      if (a.type === 'EXPENSE') return ids.has(a.walletId) ? -a.amount : 0;
-      if (a.type === 'TRANSFER') return (ids.has(a.toWalletId) ? a.amount : 0) - (ids.has(a.walletId) ? a.amount : 0);
+      const type = root.KHRules && root.KHRules.activityType ? root.KHRules.activityType(a) : String(a.type || '').toUpperCase();
+      const amount = type === 'ADJUSTMENT' ? root.KHRules.ledgerAmountValue(a.amount) : Math.abs(root.KHRules.ledgerAmountValue(a.amount));
+      if (type === 'INCOME' || type === 'ADJUSTMENT') return ids.has(a.walletId) ? amount : 0;
+      if (type === 'EXPENSE') return ids.has(a.walletId) ? -amount : 0;
+      if (type === 'TRANSFER') return (ids.has(a.toWalletId) ? amount : 0) - (ids.has(a.walletId) ? amount : 0);
       return 0;
     };
-    let opening = sum(scope.map((w) => w.openingBalance || 0));
+    let opening = sum(scope.map((w) => root.KHRules.ledgerAmountValue(w.openingBalance)));
     acts.forEach((a) => { if (a.occurredOn < o.from) opening += delta(a); });
     const rows = []; let run = opening, masuk = 0, keluar = 0;
     acts.filter((a) => a.occurredOn >= o.from && a.occurredOn <= o.to).forEach((a) => {
-      const involved = ids.has(a.walletId) || (a.type === 'TRANSFER' && ids.has(a.toWalletId));
+      const type = root.KHRules && root.KHRules.activityType ? root.KHRules.activityType(a) : String(a.type || '').toUpperCase();
+      const involved = ids.has(a.walletId) || (type === 'TRANSFER' && ids.has(a.toWalletId));
       if (!involved) return;
       const d = delta(a); run += d; if (d > 0) masuk += d; if (d < 0) keluar += -d;
       const wn = (id) => (byId[id] ? byId[id].name : '-');
       let desc, cat, wal;
-      if (a.type === 'TRANSFER') { desc = 'Pindah dana'; cat = 'Pindah dana'; wal = `${wn(a.walletId)} -> ${wn(a.toWalletId)}`; if (d === 0) desc += ' (' + rp(a.amount) + ')'; }
-      else if (a.type === 'ADJUSTMENT') { desc = a.note || 'Penyesuaian saldo'; cat = 'Penyesuaian'; wal = wn(a.walletId); }
+      if (type === 'TRANSFER') { desc = 'Pindah dana'; cat = 'Pindah dana'; wal = `${wn(a.walletId)} -> ${wn(a.toWalletId)}`; if (d === 0) desc += ' (' + rp(a.amount) + ')'; }
+      else if (type === 'ADJUSTMENT') { desc = a.note || 'Penyesuaian saldo'; cat = 'Penyesuaian'; wal = wn(a.walletId); }
       else { desc = a.merchant || a.note || a.category || '-'; cat = a.category || '-'; wal = wn(a.walletId); }
-      rows.push({ date: a.occurredOn, desc, category: cat, wallet: wal, in: d > 0 ? d : 0, out: d < 0 ? -d : 0, balance: run, type: a.type });
+      rows.push({ date: a.occurredOn, desc, category: cat, wallet: wal, in: d > 0 ? d : 0, out: d < 0 ? -d : 0, balance: run, type });
     });
     const cats = {};
     rows.filter((r) => r.type === 'EXPENSE' && r.out > 0).forEach((r) => { cats[r.category] = (cats[r.category] || 0) + r.out; });

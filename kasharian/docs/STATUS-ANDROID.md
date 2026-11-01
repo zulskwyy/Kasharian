@@ -1,4 +1,4 @@
-# Status Android v1.0.2
+# Status Android v1.0.7
 
 ## Yang sudah disiapkan di proyek
 
@@ -10,13 +10,12 @@
 - Biometrik menggunakan AndroidX BiometricPrompt; fallback PIN tetap disediakan.
 - File import menggunakan `ACTION_OPEN_DOCUMENT`; file export/backup menggunakan `ACTION_CREATE_DOCUMENT`.
 - Permission internet tidak dimasukkan ke manifest. Script workflow memeriksa permission hasil APK.
-- Jalur OCR Android tidak mengambil data bahasa melalui URL `appassets` dari Web Worker. Data `ind`/`eng`, `worker.min.js`, dan core WASM dibaca langsung dari aset APK melalui bridge native dengan daftar aset yang diizinkan.
 
 ## Hal yang belum dibuktikan
 
 1. APK belum dapat dikompilasi dalam sesi penyusunan ini karena tidak ada Android SDK, build-tools, Gradle, maupun koneksi untuk mengunduhnya. Workflow GitHub disediakan sebagai mesin build.
 2. Belum ada pengujian UI otomatis pada Android WebView dari berbagai vendor/versi.
-3. Pemindaian foto, PDF, XLSX, DOCX, dan backup perlu diuji di perangkat Android sebenarnya setelah build. Khusus OCR Android v1.0.2, verifikasi bahwa bridge native melaporkan aset lengkap dan uji foto kamera serta gambar galeri dalam mode pesawat.
+3. Pemindaian foto, PDF, XLSX, DOCX, dan backup perlu diuji di perangkat Android sebenarnya setelah build.
 4. Pengingat tagihan yang terjadwal saat aplikasi tertutup (WorkManager) belum dibuat. Yang tersedia di layar Notifikasi adalah izin dan tes notifikasi native.
 5. Pengujian wajib: instal bersih, buat PIN, kunci otomatis, biometrik, restart perangkat, cadangan salah/benar password, import file, ekspor PDF/Excel, OCR, dan mode pesawat.
 
@@ -26,3 +25,24 @@
 - Backup tetap menggunakan PBKDF2-SHA256 + AES-256-GCM dan hanya dapat dibuka oleh aplikasi asal yang sama (`apk` vs `pwa`).
 - Data keuangan tidak dikirim ke server dari aplikasi. Tautan ke kontak/jejaring sosial hanya dibuka setelah pengguna mengetuk tautan; aplikasi Android sendiri tidak meminta permission internet.
 - Penghapusan data aplikasi atau uninstall menghapus database dan kunci lokal. Cadangan manual adalah jalur pemindahan data.
+
+## Perbaikan OCR v1.0.2 (scan struk/foto: "Network error while fetching ...ind.traineddata.gz ... 404")
+
+**Gejala:** semua cara menyalakan mesin baca gagal dengan kode 404 pada `vendor/tessdata/*.traineddata.gz`, padahal berkas ada di proyek.
+**Sebab:** `WebViewAssetLoader` membalas 404 bila `AssetManager.open()` gagal. Berkas `.gz` di assets tidak bisa dibuka di build tersebut, sementara `.js`/`.css`/`.png` dari folder yang sama berhasil.
+Data modelnya sendiri sehat (diuji: `ind+eng`, OEM LSTM, confidence 94 pada contoh struk).
+
+**Perbaikan (berlapis, satu sumber rusak tidak lagi mematikan OCR):**
+1. `vendor/tessdata/<bahasa>.b64.js`: data yang sama dalam bentuk skrip, dimuat lewat `<script>` (jalur yang terbukti jalan). Dipakai mode "data bahasa dari memori" dan "mode kompatibilitas".
+2. `TessdataServer.java`: permintaan `*.traineddata(.gz)` dilayani dengan urutan `.gz` -> tanpa `.gz` -> `.b64.js`, sehingga mode standar pun jalan.
+3. `ocr.js`: urutan sumber skrip -> fetch -> jembatan native (`KHNativeStorage.readTessdata`); mode standar dilewati bila `.gz` tidak terbaca; pesan error memuat laporan isi APK (`tessdataReport`).
+4. `scripts/check-web-assets.sh` memastikan `.gz` dan `.b64.js` ada dan identik. **Jika model bahasa diganti, buat ulang `.b64.js`** (base64 dari `.gz`, format `(self.KH_TESSDATA=self.KH_TESSDATA||{}).<bahasa>="<base64>";`).
+
+**Pengujian yang sudah dilakukan di sandbox:** kompilasi Java terhadap android.jar, uji perilaku `TessdataServer` (4 skenario), uji alur `ocr.js` (4 skenario), serta OCR end-to-end dengan `worker.min.js` + core WASM asli pada kondisi `.gz` = 404, `.gz` normal, dan core `lowmem`.
+**Belum teruji:** build APK dan jalan di perangkat Android sungguhan (tidak ada Android SDK di sandbox).
+
+## Perbaikan v1.0.7: setelah scan struk, saldo terasa tidak berkurang
+
+**Temuan:** hasil scan hanya masuk ke pratinjau di layar Catat dan baru mengurangi saldo setelah "Simpan catatan" ditekan. Tombol itu berada paling bawah (di bawah foto, kolom, teks hasil baca) dan toast lama hanya berkata "Struk terbaca". Kegagalan simpan (mis. saldo dompet kurang) juga hanya berupa toast singkat. Selain itu, struk bertanggal bulan lain tidak mengurangi angka "Sisa limit belanja" dan "Keluar" bulan ini (hanya pil Saldo).
+**Perbaikan:** (1) dialog "Simpan struk ini?" langsung setelah scan bila data lengkap, berisi toko, nominal, dompet, tanggal, dan peringatan jika tanggal bukan bulan ini; (2) tombol Simpan melekat di dasar layar (`.save-bar`); (3) kegagalan simpan menampilkan dialog yang tidak hilang sendiri; (4) toast sukses menyebut saldo dompet terbaru.
+**Pengujian:** aplikasi asli dijalankan di jsdom dengan hasil scan buatan pada skenario pemasukan ada, hanya saldo awal (limit habis), dompet pertama kosong, dan tanggal bulan lalu. Hasil: transaksi tersimpan dan saldo/limit berkurang sesuai.

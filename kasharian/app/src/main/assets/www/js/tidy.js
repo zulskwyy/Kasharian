@@ -5,25 +5,32 @@
   'use strict';
   const live = (d) => d.activities.filter((a) => !a.deletedAt);
   const txt = (a) => ((a.merchant || '') + ' ' + (a.note || '')).toLowerCase();
+  const amountOf = (a) => root.KHRules && root.KHRules.ledgerAmountValue ? root.KHRules.ledgerAmountValue(a && a.amount) : (Number(a && a.amount) || 0);
   const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24);
   const dayDiff = (a, b) => Math.round((Date.parse(a) - Date.parse(b)) / 864e5);
   const MOVE_RE = /(pindah dana|top\s*-?up|isi saldo|tarik tunai|setor tunai|ke rekening sendiri|transfer dari (rekening|bank))/i;
   const clone = (x) => JSON.parse(JSON.stringify(x));
-  const isOut = (a) => a.type === 'EXPENSE' || (a.type === 'ADJUSTMENT' && a.amount < 0);
-  const isIn = (a) => a.type === 'INCOME' || (a.type === 'ADJUSTMENT' && a.amount > 0);
+  const kindOf = (a) => { if (root.KHRules && root.KHRules.activityType) return root.KHRules.activityType(a); const t = String(a.type || a.kind || '').trim().toUpperCase().replace(/[\s-]+/g, '_'); return ({ IN: 'INCOME', MASUK: 'INCOME', PEMASUKAN: 'INCOME', INCOMING: 'INCOME', CREDIT: 'INCOME', DEPOSIT: 'INCOME', OUT: 'EXPENSE', KELUAR: 'EXPENSE', PENGELUARAN: 'EXPENSE', OUTGOING: 'EXPENSE', SPEND: 'EXPENSE', SPENDING: 'EXPENSE', DEBIT: 'EXPENSE', PAYMENT: 'EXPENSE', MOVE: 'TRANSFER', PINDAH: 'TRANSFER', PINDAH_DANA: 'TRANSFER', INTERNAL_TRANSFER: 'TRANSFER' })[t] || t; };
+  const isOut = (a) => kindOf(a) === 'EXPENSE' || (kindOf(a) === 'ADJUSTMENT' && amountOf(a) < 0);
+  const isIn = (a) => kindOf(a) === 'INCOME' || (kindOf(a) === 'ADJUSTMENT' && amountOf(a) > 0);
 
   function balances(d) {
-    const res = {}; d.wallets.forEach((w) => { res[w.id] = w.openingBalance || 0; });
+    const res = {}; d.wallets.forEach((w) => { res[w.id] = root.KHRules && root.KHRules.ledgerAmountValue ? root.KHRules.ledgerAmountValue(w.openingBalance) : (Number(w.openingBalance) || 0); });
     live(d).forEach((a) => {
-      if (a.type === 'INCOME' || a.type === 'ADJUSTMENT') res[a.walletId] = (res[a.walletId] || 0) + a.amount;
-      else if (a.type === 'EXPENSE') res[a.walletId] = (res[a.walletId] || 0) - a.amount;
-      else if (a.type === 'TRANSFER') { res[a.walletId] = (res[a.walletId] || 0) - a.amount; if (a.toWalletId) res[a.toWalletId] = (res[a.toWalletId] || 0) + a.amount; }
+      const amount = Math.abs(amountOf(a));
+      if (kindOf(a) === 'INCOME') res[a.walletId] = (res[a.walletId] || 0) + amount;
+      else if (kindOf(a) === 'ADJUSTMENT') res[a.walletId] = (res[a.walletId] || 0) + amountOf(a);
+      else if (kindOf(a) === 'EXPENSE') res[a.walletId] = (res[a.walletId] || 0) - amount;
+      else if (kindOf(a) === 'TRANSFER' && a.toWalletId && a.toWalletId !== a.walletId) {
+        res[a.walletId] = (res[a.walletId] || 0) - amount;
+        res[a.toWalletId] = (res[a.toWalletId] || 0) + amount;
+      }
     });
     return res;
   }
   function totals(d) {
     let income = 0, expense = 0, moved = 0;
-    live(d).forEach((a) => { if (a.type === 'INCOME') income += a.amount; else if (a.type === 'EXPENSE') expense += a.amount; else if (a.type === 'TRANSFER') moved += a.amount; });
+    live(d).forEach((a) => { if (kindOf(a) === 'INCOME') income += Math.abs(amountOf(a)); else if (kindOf(a) === 'EXPENSE') expense += Math.abs(amountOf(a)); else if (kindOf(a) === 'TRANSFER') moved += Math.abs(amountOf(a)); });
     const b = balances(d), total = d.wallets.filter((w) => w.includeInTotal !== false && !w.archived).reduce((s, w) => s + (b[w.id] || 0), 0);
     return { income, expense, moved, total, balances: b };
   }
@@ -49,37 +56,37 @@
     Object.values(byName).filter((g) => g.length > 1).forEach((g) => mk({ kind: 'walletdup', safe: true, apply: true, title: `Dompet "${g[0].name}" ada ${g.length} buah`, detail: 'Digabung jadi satu dompet. Riwayat dan saldo awal ikut dipindahkan.', wallets: g.map((w) => w.id) }));
 
     // 2. data ganda dari impor yang sama (sourceId sama)
-    const bySrc = {}; acts.forEach((a) => { if (a.sourceId) (bySrc[a.sourceId + '|' + a.type + '|' + a.walletId] = bySrc[a.sourceId + '|' + a.type + '|' + a.walletId] || []).push(a); });
-    Object.values(bySrc).filter((g) => g.length > 1).forEach((g) => { g.slice(1).forEach((x) => used.add(x.id)); mk({ kind: 'dupe', safe: true, apply: true, title: `Catatan ganda: ${g[0].merchant || g[0].note || 'transaksi'} ${fmt(Math.abs(g[0].amount))}`, detail: `Tercatat ${g.length} kali dari impor yang sama (${g[0].occurredOn}). Sisanya disembunyikan.`, ids: g.map((x) => x.id) }); });
+    const bySrc = {}; acts.forEach((a) => { if (a.sourceId) (bySrc[a.sourceId + '|' + kindOf(a) + '|' + a.walletId] = bySrc[a.sourceId + '|' + kindOf(a) + '|' + a.walletId] || []).push(a); });
+    Object.values(bySrc).filter((g) => g.length > 1).forEach((g) => { g.slice(1).forEach((x) => used.add(x.id)); mk({ kind: 'dupe', safe: true, apply: true, title: `Catatan ganda: ${g[0].merchant || g[0].note || 'transaksi'} ${fmt(Math.abs(amountOf(g[0])))}`, detail: `Tercatat ${g.length} kali dari impor yang sama (${g[0].occurredOn}). Sisanya disembunyikan.`, ids: g.map((x) => x.id) }); });
     // ganda mirip (tanpa penanda impor): tanya
-    const bySim = {}; acts.filter((a) => !used.has(a.id) && a.source && a.source !== 'manual' && a.type !== 'TRANSFER').forEach((a) => { const k = [a.type, a.walletId, a.amount, a.occurredOn, norm(a.merchant || a.note)].join('|'); (bySim[k] = bySim[k] || []).push(a); });
-    Object.values(bySim).filter((g) => g.length > 1).forEach((g) => { g.slice(1).forEach((x) => used.add(x.id)); mk({ kind: 'dupe', safe: false, apply: g.every((x) => x.source === 'struk'), title: `Mungkin ganda: ${g[0].merchant || g[0].note || 'transaksi'} ${fmt(Math.abs(g[0].amount))}`, detail: `${g.length} catatan dengan tanggal, dompet, dan nominal sama (${g[0].occurredOn}). Hapus yang kembar?`, ids: g.map((x) => x.id) }); });
+    const bySim = {}; acts.filter((a) => !used.has(a.id) && a.source && a.source !== 'manual' && kindOf(a) !== 'TRANSFER').forEach((a) => { const k = [kindOf(a), a.walletId, amountOf(a), a.occurredOn, norm(a.merchant || a.note)].join('|'); (bySim[k] = bySim[k] || []).push(a); });
+    Object.values(bySim).filter((g) => g.length > 1).forEach((g) => { g.slice(1).forEach((x) => used.add(x.id)); mk({ kind: 'dupe', safe: false, apply: g.every((x) => x.source === 'struk'), title: `Mungkin ganda: ${g[0].merchant || g[0].note || 'transaksi'} ${fmt(Math.abs(amountOf(g[0])))}`, detail: `${g.length} catatan dengan tanggal, dompet, dan nominal sama (${g[0].occurredOn}). Hapus yang kembar?`, ids: g.map((x) => x.id) }); });
 
     // 3. pasangan keluar-masuk antar dompet = satu perpindahan
     const outs = acts.filter((a) => !used.has(a.id) && isOut(a)), ins = acts.filter((a) => !used.has(a.id) && isIn(a));
     outs.forEach((a) => {
-      const cand = ins.filter((b) => !used.has(b.id) && b.walletId !== a.walletId && Math.abs(b.amount) === Math.abs(a.amount) && Math.abs(dayDiff(a.occurredOn, b.occurredOn)) <= 1).sort((p, q) => Math.abs(dayDiff(a.occurredOn, p.occurredOn)) - Math.abs(dayDiff(a.occurredOn, q.occurredOn)))[0];
+      const cand = ins.filter((b) => !used.has(b.id) && b.walletId !== a.walletId && Math.abs(amountOf(b)) === Math.abs(amountOf(a)) && Math.abs(dayDiff(a.occurredOn, b.occurredOn)) <= 1).sort((p, q) => Math.abs(dayDiff(a.occurredOn, p.occurredOn)) - Math.abs(dayDiff(a.occurredOn, q.occurredOn)))[0];
       if (!cand || used.has(a.id)) return; used.add(a.id); used.add(cand.id);
       const hint = MOVE_RE.test(txt(a)) || MOVE_RE.test(txt(cand));
-      mk({ kind: 'pair', safe: hint, apply: hint, title: `${fmt(Math.abs(a.amount))} keluar dari ${wn(a.walletId)} dan masuk ke ${wn(cand.walletId)}`, detail: `Keduanya ${a.occurredOn === cand.occurredOn ? 'sehari' : 'berdekatan'} dan nominalnya sama, kemungkinan satu perpindahan dana, bukan pemasukan dan pengeluaran. Satukan jadi pindah dana?`, ids: [a.id, cand.id] });
+      mk({ kind: 'pair', safe: hint, apply: hint, title: `${fmt(Math.abs(amountOf(a)))} keluar dari ${wn(a.walletId)} dan masuk ke ${wn(cand.walletId)}`, detail: `Keduanya ${a.occurredOn === cand.occurredOn ? 'sehari' : 'berdekatan'} dan nominalnya sama, kemungkinan satu perpindahan dana, bukan pemasukan dan pengeluaran. Satukan jadi pindah dana?`, ids: [a.id, cand.id] });
     });
 
     // 4. pindah dana yang tersimpan sepihak (penyesuaian, atau pemasukan "top up")
-    acts.filter((a) => !used.has(a.id) && a.type !== 'TRANSFER' && MOVE_RE.test(txt(a)) && (a.type === 'ADJUSTMENT' || a.type === 'INCOME' || a.type === 'EXPENSE')).forEach((a) => {
+    acts.filter((a) => !used.has(a.id) && kindOf(a) !== 'TRANSFER' && MOVE_RE.test(txt(a)) && (['ADJUSTMENT', 'INCOME', 'EXPENSE'].includes(kindOf(a)))).forEach((a) => {
       used.add(a.id); const partner = guessPartner(d, a.walletId, a), out = isOut(a), ws = d.wallets.filter((w) => !w.archived && w.id !== a.walletId);
       if (!ws.length) return;
       mk({ kind: 'move', safe: false, apply: !!partner, partner, partners: ws.map((w) => ({ id: w.id, name: w.name })),
-        title: `${a.merchant || a.note || 'Pindah dana'} ${fmt(Math.abs(a.amount))} tercatat sebagai ${a.type === 'INCOME' ? 'pemasukan' : a.type === 'EXPENSE' ? 'pengeluaran' : 'penyesuaian'} di ${wn(a.walletId)}`,
+        title: `${a.merchant || a.note || 'Pindah dana'} ${fmt(Math.abs(amountOf(a)))} tercatat sebagai ${kindOf(a) === 'INCOME' ? 'pemasukan' : kindOf(a) === 'EXPENSE' ? 'pengeluaran' : 'penyesuaian'} di ${wn(a.walletId)}`,
         detail: out ? 'Ini terlihat seperti dana yang pindah ke dompet lain. Pilih dompet tujuannya:' : 'Ini terlihat seperti dana yang masuk dari dompet lain (bukan gaji baru). Pilih dompet asalnya:', ids: [a.id] });
     });
 
     // 5. kategori belum pasti
-    const unc = {}; acts.filter((a) => a.type === 'EXPENSE' && a.category === 'Belum pasti').forEach((a) => { const k = norm(a.merchant || a.note) || '_'; (unc[k] = unc[k] || []).push(a); });
+    const unc = {}; acts.filter((a) => kindOf(a) === 'EXPENSE' && a.category === 'Belum pasti').forEach((a) => { const k = norm(a.merchant || a.note) || '_'; (unc[k] = unc[k] || []).push(a); });
     Object.entries(unc).forEach(([k, g]) => { const guess = o.categorize ? o.categorize(g[0].merchant || g[0].note || '') : null; mk({ kind: 'cat', safe: !!guess, apply: !!guess, category: guess || '', cats: o.cats || [], title: `${g[0].merchant || g[0].note || 'Tanpa nama'} (${g.length} catatan) belum punya kategori`, detail: guess ? `Cocok dengan kategori ${guess}.` : 'Pilih kategori agar masuk hitungan Rencana uang.', ids: g.map((x) => x.id) }); });
 
     // 6. nominal janggal dari struk
-    const exp = acts.filter((a) => a.type === 'EXPENSE').map((a) => a.amount).sort((p, q) => p - q), med = exp.length ? exp[exp.length >> 1] : 0;
-    acts.filter((a) => a.type === 'EXPENSE' && a.source === 'struk' && a.amount >= 1000000 && a.amount > med * 20).forEach((a) => mk({ kind: 'big', safe: false, apply: false, newAmount: 0, title: `Nominal struk janggal: ${a.merchant || a.note || 'struk'} ${fmt(a.amount)}`, detail: 'Jauh di atas pengeluaran Anda yang biasa, mungkin salah baca. Isi nominal yang benar bila perlu:', ids: [a.id] }));
+    const exp = acts.filter((a) => kindOf(a) === 'EXPENSE').map((a) => Math.abs(amountOf(a))).sort((p, q) => p - q), med = exp.length ? exp[exp.length >> 1] : 0;
+    acts.filter((a) => kindOf(a) === 'EXPENSE' && a.source === 'struk' && Math.abs(amountOf(a)) >= 1000000 && Math.abs(amountOf(a)) > med * 20).forEach((a) => mk({ kind: 'big', safe: false, apply: false, newAmount: 0, title: `Nominal struk janggal: ${a.merchant || a.note || 'struk'} ${fmt(amountOf(a))}`, detail: 'Jauh di atas pengeluaran Anda yang biasa, mungkin salah baca. Isi nominal yang benar bila perlu:', ids: [a.id] }));
 
     const ign = new Set(o.ignore || []);
     return { items: items.filter((it) => !ign.has(sigOf(it))), totals: totals(d) };
@@ -90,12 +97,12 @@
     o = o || {}; const now = o.now || Date.now(), uid = o.uid || (() => 'x' + Math.random().toString(36).slice(2)), find = (id) => d.activities.find((a) => a.id === id && !a.deletedAt);
     let n = 0;
     items.filter((it) => it.apply).forEach((it) => {
-      if (it.kind === 'walletdup') { const [first, ...rest] = it.wallets.map((id) => d.wallets.find((w) => w.id === id)).filter(Boolean); rest.forEach((w) => { d.activities.forEach((a) => { if (a.walletId === w.id) a.walletId = first.id; if (a.toWalletId === w.id) a.toWalletId = first.id; }); first.openingBalance = (first.openingBalance || 0) + (w.openingBalance || 0); w.openingBalance = 0; w.archived = true; }); n++; }
+      if (it.kind === 'walletdup') { const [first, ...rest] = it.wallets.map((id) => d.wallets.find((w) => w.id === id)).filter(Boolean); rest.forEach((w) => { d.activities.forEach((a) => { if (a.walletId === w.id) a.walletId = first.id; if (a.toWalletId === w.id) a.toWalletId = first.id; }); first.openingBalance = amountOf({ amount: first.openingBalance }) + amountOf({ amount: w.openingBalance }); w.openingBalance = 0; w.archived = true; }); n++; }
       else if (it.kind === 'dupe') { it.ids.slice(1).forEach((id) => { const a = find(id); if (a) { a.deletedAt = now; a.updatedAt = now; } }); n++; }
-      else if (it.kind === 'pair') { const a = find(it.ids[0]), b = find(it.ids[1]); if (a && b) { Object.assign(a, { type: 'TRANSFER', amount: Math.abs(a.amount), toWalletId: b.walletId, category: 'Pindah dompet', note: 'Pindah dana (digabung otomatis)', updatedAt: now }); b.deletedAt = now; b.updatedAt = now; n++; } }
-      else if (it.kind === 'move') { const a = find(it.ids[0]); if (a && it.partner && it.partner !== a.walletId) { const out = isOut(a), amt = Math.abs(a.amount), me = a.walletId; Object.assign(a, { type: 'TRANSFER', amount: amt, walletId: out ? me : it.partner, toWalletId: out ? it.partner : me, category: 'Pindah dompet', updatedAt: now }); n++; } }
+      else if (it.kind === 'pair') { const a = find(it.ids[0]), b = find(it.ids[1]); if (a && b) { Object.assign(a, { type: 'TRANSFER', amount: Math.abs(amountOf(a)), toWalletId: b.walletId, category: 'Pindah dompet', note: 'Pindah dana (digabung otomatis)', updatedAt: now }); b.deletedAt = now; b.updatedAt = now; n++; } }
+      else if (it.kind === 'move') { const a = find(it.ids[0]); if (a && it.partner && it.partner !== a.walletId) { const out = isOut(a), amt = Math.abs(amountOf(a)), me = a.walletId; Object.assign(a, { type: 'TRANSFER', amount: amt, walletId: out ? me : it.partner, toWalletId: out ? it.partner : me, category: 'Pindah dompet', updatedAt: now }); n++; } }
       else if (it.kind === 'cat') { if (it.category) { it.ids.forEach((id) => { const a = find(id); if (a) { a.category = it.category; a.updatedAt = now; } }); n++; } }
-      else if (it.kind === 'big') { const a = find(it.ids[0]); if (a && it.newAmount > 0 && it.newAmount !== a.amount) { a.amount = it.newAmount; a.updatedAt = now; n++; } }
+      else if (it.kind === 'big') { const a = find(it.ids[0]); if (a && it.newAmount > 0 && it.newAmount !== amountOf(a)) { a.amount = it.newAmount; a.updatedAt = now; n++; } }
     });
     const fix = o.fix || {}, b = balances(d);
     Object.entries(fix).forEach(([wid, actual]) => { if (actual == null || actual === '' || isNaN(actual)) return; const diff = Math.round(actual) - Math.round(b[wid] || 0); if (diff) { d.activities.push(diff < 0 ? { id: uid(), type: 'EXPENSE', amount: -diff, walletId: wid, toWalletId: null, category: 'Lainnya', occurredOn: o.today, merchant: 'Selisih saldo', note: 'Pengeluaran belum tercatat (selisih dengan saldo nyata)', source: 'selisih', sourceId: null, createdAt: now, updatedAt: now, deletedAt: null } : { id: uid(), type: 'ADJUSTMENT', amount: diff, walletId: wid, toWalletId: null, category: 'Penyesuaian', occurredOn: o.today, merchant: null, note: 'Penyesuaian saldo saat rapikan data', source: 'rapikan', sourceId: null, createdAt: now, updatedAt: now, deletedAt: null }); n++; } });
@@ -179,4 +186,4 @@
     else { drawSum(); drawBody(); children.push(sum, body); }
     return frame({ title: 'Rapikan data', back: true, children });
   };
-})(typeof self !== 'undefined' ? self : this);
+})(typeof self !== 'undefined' ? self : (typeof globalThis !== 'undefined' ? globalThis : this));

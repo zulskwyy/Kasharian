@@ -1,11 +1,11 @@
 # KasHarian Android — paket build GitHub
 
-Paket ini mengambil UI dan logika KasHarian v1.0.2 dari PWA yang Anda kirim, lalu menyediakannya sebagai aset lokal di dalam aplikasi Android melalui WebView lokal (bukan membuka URL website). APK **tidak membuka alamat GitHub Pages** dan tidak memakai TWA. Penyimpanan transaksi dialihkan ke SQLCipher native, terpisah dari `localStorage` PWA. Identitas paket Android adalah `id.kasharian.app`, terpisah dari ID PWA `kasharian-pwa`.
+Paket ini mengambil UI dan logika KasHarian v1.0.7 dari PWA yang Anda kirim, lalu menyediakannya sebagai aset lokal di dalam aplikasi Android melalui WebView lokal (bukan membuka URL website). APK **tidak membuka alamat GitHub Pages** dan tidak memakai TWA. Penyimpanan transaksi dialihkan ke SQLCipher native, terpisah dari `localStorage` PWA. Identitas paket Android adalah `id.kasharian.app`, terpisah dari ID PWA `kasharian-pwa`.
 
 ## Fitur yang disambungkan untuk APK
 
 - UI KasHarian, pengelolaan dompet/transaksi/rencana/tagihan, bahasa Indonesia/Inggris, grafik, dan pemindai dokumen berjalan dari aset lokal.
-- OCR dan pembaca PDF memakai file Tesseract/PDF.js yang ikut di dalam APK. Mesin OCR Android membaca model bahasa, worker, dan inti WebAssembly langsung dari `AssetManager` melalui bridge native; tidak memakai fetch WebView worker ke URL `appassets` dan tidak membutuhkan jaringan.
+- OCR dan pembaca PDF memakai file Tesseract/PDF.js yang ikut di dalam APK. Tidak perlu mengunduh model ketika aplikasi dibuka.
 - Data key/value aplikasi diarahkan ke basis data **SQLCipher**. Kunci acak 256-bit dibungkus oleh kunci AES di Android Keystore.
 - PIN dan 12 kata pemulihan tetap dijalankan oleh logika KasHarian. Verifikasi biometrik Android menggunakan `BiometricPrompt`.
 - Pilih file dan simpan cadangan/ekspor melalui pemilih file Android (Storage Access Framework), tanpa izin penyimpanan umum.
@@ -23,10 +23,10 @@ Paket ini mengambil UI dan logika KasHarian v1.0.2 dari PWA yang Anda kirim, lal
    - `KASHARIAN_KEY_ALIAS`
    - `KASHARIAN_KEY_PASSWORD`
 5. Buka tab `Actions`, pilih workflow `Build KasHarian APK`, lalu jalankan `Run workflow` (atau push ke branch `main`).
-6. Setelah status workflow hijau, buka hasil run dan unduh artifact `KasHarian-v1.0.2-release`. Di dalam artifact ada `KasHarian-v1.0.2-release.apk`.
-7. Untuk membuat halaman GitHub Release yang langsung menampilkan APK, buat dan push tag `v1.0.2`. Workflow akan melampirkan APK pada Release tersebut.
+6. Setelah status workflow hijau, buka hasil run dan unduh artifact `KasHarian-v1.0.7-release`. Di dalam artifact ada `KasHarian-v1.0.7-release.apk`.
+7. Untuk membuat halaman GitHub Release yang langsung menampilkan APK, buat dan push tag `v1.0.7`. Workflow akan melampirkan APK pada Release tersebut.
 
-Build memakai GitHub-hosted runner. Anda tidak perlu memasang Android Studio, Android SDK, atau Gradle di HP/komputer Anda. Setelah build berhasil, workflow membuat file `KasHarian-v1.0.2-release.apk`; bila pemicu berupa tag `v1.0.2`, file itu juga dilampirkan ke GitHub Release.
+Build memakai GitHub-hosted runner. Anda tidak perlu memasang Android Studio, Android SDK, atau Gradle di HP/komputer Anda. Setelah build berhasil, workflow membuat file `KasHarian-v1.0.7-release.apk`; bila pemicu berupa tag `v1.0.7`, file itu juga dilampirkan ke GitHub Release.
 
 ## Kunci penandatanganan
 
@@ -35,8 +35,8 @@ Kunci rilis RSA 4096-bit dibuat untuk proyek ini. Gunakan file kunci yang diberi
 ## Versi dan identitas
 
 - `applicationId`: `id.kasharian.app`
-- `versionCode`: `102`
-- `versionName`: `1.0.2`
+- `versionCode`: `106`
+- `versionName`: `1.0.7`
 - `minSdk`: 26 (Android 8.0)
 - `targetSdk` / `compileSdk`: 36
 
@@ -49,3 +49,7 @@ Paket ini adalah build Android pertama yang disusun dari source web yang tersedi
 Layar notifikasi menyediakan permintaan izin dan tombol tes notifikasi Android. Penjadwalan pengingat tagihan otomatis saat aplikasi tertutup belum ditambahkan sebagai pekerjaan WorkManager; jangan mengiklankan notifikasi jatuh tempo terjadwal sampai bagian itu dibuat dan diuji.
 
 Detail implementasi dan hal yang belum diverifikasi ada di `docs/STATUS-ANDROID.md`.
+
+## Catatan perbaikan v1.0.7
+
+Perbaikan logika saldo, nominal legacy, arah pengeluaran/pemasukan, pengisian OCR otomatis, dan konsistensi Planning dijelaskan di `docs/LEDGER-REPAIR-v1.0.7.md`.

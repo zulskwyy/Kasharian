@@ -56,15 +56,15 @@
     return Math.max(0, sum(P.buckets.filter((b) => !b.save).map((b) => allocated[b.id] || 0)));
   }
 
-  const isSalaryDeduction = (a) => a && a.type === 'EXPENSE' && a.source === 'slip' && /potongan/i.test([a.category, a.note].join(' '));
+  const isSalaryDeduction = (a) => a && R.activityType(a) === 'EXPENSE' && a.source === 'slip' && /potongan/i.test([a.category, a.note].join(' '));
   const isSavingsWalletExpense = (a) => {
-    if (!a || a.type !== 'EXPENSE') return false;
+    if (!a || R.activityType(a) !== 'EXPENSE') return false;
     const w = db().wallets.find((x) => x.id === a.walletId);
     return !!w && (w.type === 'SAVINGS' || w.type === 'EMERGENCY');
   };
   /** Transfers to savings wallets and investments are reserved savings, not everyday spending. */
   function isBudgetExpense(a) {
-    if (!a || a.type !== 'EXPENSE' || isSalaryDeduction(a) || isSavingsWalletExpense(a)) return false;
+    if (!a || R.activityType(a) !== 'EXPENSE' || isSalaryDeduction(a) || isSavingsWalletExpense(a)) return false;
     const c = KHBucket.classify(a, { memory: db().bucketMemory || {}, userMap: (db().plan && db().plan.mapUser) || {} });
     return c.nature !== 'save';
   }
@@ -73,11 +73,11 @@
    * dihitung dari pemilahan otomatis tiap pengeluaran. Tabungan dipisah. */
   function state(ym) {
     const P = plan(), acts = A.liveActs();
-    const inMonth = (m) => acts.filter((a) => a.type === 'INCOME' && R.monthOf(a.occurredOn) === m);
-    let incomes = inMonth(ym).map((a) => [a.category, a.amount]), est = false;
+    const inMonth = (m) => acts.filter((a) => R.activityType(a) === 'INCOME' && R.monthOf(a.occurredOn) === m);
+    let incomes = inMonth(ym).map((a) => [a.category, Math.abs(R.ledgerAmountValue(a.amount))]), est = false;
     if (!incomes.length) {
-      let e = P.estimate || sum(inMonth(R.addMonths(ym, -1)).map((a) => a.amount));
-      if (!e) { const ms = [...new Set(acts.filter((a) => a.type === 'INCOME').map((a) => R.monthOf(a.occurredOn)))].sort(); if (ms.length) e = sum(inMonth(ms[ms.length - 1]).map((a) => a.amount)); }
+      let e = P.estimate || sum(inMonth(R.addMonths(ym, -1)).map((a) => Math.abs(R.ledgerAmountValue(a.amount))));
+      if (!e) { const ms = [...new Set(acts.filter((a) => R.activityType(a) === 'INCOME').map((a) => R.monthOf(a.occurredOn)))].sort(); if (ms.length) e = sum(inMonth(ms[ms.length - 1]).map((a) => Math.abs(R.ledgerAmountValue(a.amount)))); }
       if (e > 0) { incomes = [['*', e]]; est = true; }
     }
     const alloc = {};
@@ -89,13 +89,13 @@
 
     const ctx = { memory: db().bucketMemory || {}, userMap: P.mapUser || {} }, review = new Map();
     let spentThisMonth = 0;
-    acts.filter((a) => a.type === 'EXPENSE' && R.monthOf(a.occurredOn) === ym).forEach((a) => {
+    acts.filter((a) => R.activityType(a) === 'EXPENSE' && R.monthOf(a.occurredOn) === ym).forEach((a) => {
       const c = KHBucket.classify(a, ctx);
-      if (isBudgetExpense(a)) spentThisMonth += a.amount;
+      if (isBudgetExpense(a)) spentThisMonth += Math.abs(R.ledgerAmountValue(a.amount));
       if (!c.confident) {
         const k = KHBucket.keyOf(a) || '_' + a.category;
         const r = review.get(k) || { key: k, name: a.merchant || a.note || a.category, count: 0, amount: 0, ids: [], guess: c.nature };
-        r.count++; r.amount += a.amount; r.ids.push(a.id); review.set(k, r);
+        r.count++; r.amount += Math.abs(R.ledgerAmountValue(a.amount)); r.ids.push(a.id); review.set(k, r);
       }
     });
 
@@ -106,7 +106,7 @@
     const savedGross = Object.fromEntries(saveBuckets.map((b) => [b.id, 0]));
     const currentBucketFor = (oldId, oldName) => saveBuckets.find((b) => b.id === oldId)
       || saveBuckets.find((b) => oldName && b.name.toLowerCase() === String(oldName).toLowerCase()) || firstSave;
-    acts.filter((a) => a.type === 'INCOME').forEach((a) => {
+    acts.filter((a) => R.activityType(a) === 'INCOME').forEach((a) => {
       const snap = a.planAllocation;
       if (snap && snap.amounts && snap.buckets) {
         const meta = new Map(snap.buckets.map((b) => [b.id, b]));
@@ -117,15 +117,15 @@
           if (target) savedGross[target.id] += Math.max(0, Number(value) || 0);
         });
       } else {
-        const shares = allocationForIncome(a.amount, a.category);
+        const shares = allocationForIncome(Math.abs(R.ledgerAmountValue(a.amount)), a.category);
         P.buckets.filter((b) => b.save).forEach((b) => { savedGross[b.id] += Math.max(0, Number(shares[b.id]) || 0); });
       }
     });
     // Existing saving/investment entries count as an additional goal contribution
     // only when they are recorded as an expense outside a dedicated savings wallet.
-    acts.filter((a) => a.type === 'EXPENSE' && !isSalaryDeduction(a) && !isSavingsWalletExpense(a)
+    acts.filter((a) => R.activityType(a) === 'EXPENSE' && !isSalaryDeduction(a) && !isSavingsWalletExpense(a)
       && KHBucket.classify(a, ctx).nature === 'save').forEach((a) => {
-        if (firstSave) savedGross[firstSave.id] += Math.max(0, Number(a.amount) || 0);
+        if (firstSave) savedGross[firstSave.id] += Math.abs(R.ledgerAmountValue(a.amount));
       });
     // Savings authorized for an over-limit expense reduce the goal balance. Legacy
     // records without a per-goal map consume savings goals in their displayed order.
@@ -141,9 +141,9 @@
     });
     // Purchases paid directly from a savings/emergency wallet must also reduce
     // goal progress, even when they did not cross the monthly spending envelope.
-    acts.filter((a) => a.type === 'EXPENSE' && isSavingsWalletExpense(a) && !(Number(a.budgetSavingsUsed) > 0))
+    acts.filter((a) => R.activityType(a) === 'EXPENSE' && isSavingsWalletExpense(a) && !(Number(a.budgetSavingsUsed) > 0))
       .forEach((a) => {
-        let take = Math.max(0, Number(a.amount) || 0);
+        let take = Math.abs(R.ledgerAmountValue(a.amount));
         saveBuckets.forEach((b) => { const got = Math.min(take, savedByBucket[b.id] || 0); savedByBucket[b.id] = Math.max(0, (savedByBucket[b.id] || 0) - got); take -= got; });
       });
     const savingsProgress = sum(saveBuckets.map((b) => savedByBucket[b.id] || 0));
@@ -156,9 +156,9 @@
     const ordered = [...P.buckets.filter((b) => !b.save), ...saveBuckets];
     const usedBy = {};
     P.buckets.forEach((b) => { usedBy[b.id] = 0; });
-    acts.filter((a) => a.type === 'EXPENSE' && R.monthOf(a.occurredOn) === ym && isBudgetExpense(a)).forEach((a) => {
+    acts.filter((a) => R.activityType(a) === 'EXPENSE' && R.monthOf(a.occurredOn) === ym && isBudgetExpense(a)).forEach((a) => {
       const bk = P.buckets.find((x) => x.id === KHBucket.bucketIdFor(P.buckets, KHBucket.classify(a, ctx).nature, a));
-      if (bk && !bk.save) usedBy[bk.id] += a.amount;
+      if (bk && !bk.save) usedBy[bk.id] += Math.abs(R.ledgerAmountValue(a.amount));
     });
     // Nyawa mengalir: pengeluaran lebih dulu mengurangi kelompoknya sendiri. Bila kelompok itu habis, kelebihannya
     // langsung mengurangi kelompok belanja berikutnya (Kebutuhan -> Keinginan). Bila semuanya habis, barulah
@@ -192,7 +192,7 @@
   function assertExpenseAllowed(a) {
     if (!a || a.type !== 'EXPENSE') return true;
     if (isSalaryDeduction(a)) return true;
-    const ym = R.monthOf(a.occurredOn || R.todayISO()), s = state(ym), amt = Math.max(0, Number(a.amount) || 0);
+    const ym = R.monthOf(a.occurredOn || R.todayISO()), s = state(ym), amt = Math.abs(R.ledgerAmountValue(a.amount));
     if (isSavingsWalletExpense(a)) {
       if (s.spendable > 0) throw new Error(`Limit kebutuhan dan keinginan masih tersisa ${R.rupiah(s.spendable)}. Gunakan itu terlebih dahulu agar tabungan tetap terlindungi.`);
       if (amt > s.savingsAvailable) throw new Error(`Saldo tabungan yang tersedia hanya ${R.rupiah(s.savingsAvailable)}. Catat pemasukan tambahan atau periksa saldo dompet tabungan.`);
@@ -333,9 +333,9 @@
 
   function recommend() {
     const prev = R.addMonths(R.monthOf(R.todayISO()), -1), acts = A.liveActs();
-    const inc = sum(acts.filter((a) => a.type === 'INCOME' && R.monthOf(a.occurredOn) === prev).map((a) => a.amount));
+    const inc = sum(acts.filter((a) => R.activityType(a) === 'INCOME' && R.monthOf(a.occurredOn) === prev).map((a) => Math.abs(R.ledgerAmountValue(a.amount))));
     if (!inc) return { key: '50-30-20', why: 'Belum ada riwayat bulan lalu. Mulai dari aturan umum 50/30/20.' };
-    const need = sum(acts.filter((a) => a.type === 'EXPENSE' && R.monthOf(a.occurredOn) === prev && !['Belanja', 'Hiburan'].includes(a.category)).map((a) => a.amount));
+    const need = sum(acts.filter((a) => R.activityType(a) === 'EXPENSE' && R.monthOf(a.occurredOn) === prev && !['Belanja', 'Hiburan'].includes(a.category)).map((a) => Math.abs(R.ledgerAmountValue(a.amount))));
     const pct = Math.round(need * 100 / inc), key = pct > 65 ? '70-20-10' : pct > 55 ? '60-20-20' : '50-30-20';
     return { key, why: `Bulan lalu kebutuhan memakai ${pct}% pemasukan, jadi ${PRESETS[key].label} paling masuk akal.` };
   }
@@ -653,11 +653,11 @@
   function salarySlipMatch(r) {
     if (r.neg) return null;
     const amt = Math.max(0, Number(r.amt) || 0), desc = String(r.desc || '').toLowerCase();
-    const pool = A.liveActs().filter((a) => a.type === 'INCOME' && a.source === 'slip' && Math.abs(Number(a.amount) - amt) <= 1000 && Math.abs(R.daysBetween(a.occurredOn, r.date)) <= 3);
+    const pool = A.liveActs().filter((a) => a.type === 'INCOME' && a.source === 'slip' && Math.abs(R.ledgerAmountValue(a.amount) - amt) <= 1000 && Math.abs(R.daysBetween(a.occurredOn, r.date)) <= 3);
     if (!pool.length) return null;
     // Exact amount/date is strong evidence; otherwise require transfer/payroll wording.
-    const ranked = pool.filter((a) => Number(a.amount) === amt || /transfer|top.?up|isi saldo|gaji|payroll|salary|penerimaan/.test(desc))
-      .sort((a, b) => Math.abs(R.daysBetween(a.occurredOn, r.date)) - Math.abs(R.daysBetween(b.occurredOn, r.date)) || Math.abs(a.amount - amt) - Math.abs(b.amount - amt));
+    const ranked = pool.filter((a) => R.ledgerAmountValue(a.amount) === amt || /transfer|top.?up|isi saldo|gaji|payroll|salary|penerimaan/.test(desc))
+      .sort((a, b) => Math.abs(R.daysBetween(a.occurredOn, r.date)) - Math.abs(R.daysBetween(b.occurredOn, r.date)) || Math.abs(R.ledgerAmountValue(a.amount) - amt) - Math.abs(R.ledgerAmountValue(b.amount) - amt));
     return ranked[0] || null;
   }
   /** Transfers always have two wallet IDs and never count as new income/expense. */

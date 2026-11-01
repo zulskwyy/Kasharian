@@ -12,13 +12,13 @@
   function analyze(ym) {
     ym = ym || R.monthOf(R.todayISO());
     const months = [R.addMonths(ym, -3), R.addMonths(ym, -2), R.addMonths(ym, -1)], acts = A.liveActs();
-    const inMonth = (m, t) => acts.filter((a) => a.type === t && R.monthOf(a.occurredOn) === m);
+    const inMonth = (m, t) => acts.filter((a) => R.activityType(a) === t && R.monthOf(a.occurredOn) === m);
     const withData = months.filter((m) => inMonth(m, 'INCOME').length || inMonth(m, 'EXPENSE').length).length;
-    const incomeAvg = Math.round(sum(months.map((m) => sum(inMonth(m, 'INCOME').map((a) => a.amount)))) / 3);
+    const incomeAvg = Math.round(sum(months.map((m) => sum(inMonth(m, 'INCOME').map((a) => Math.abs(R.ledgerAmountValue(a.amount)))))) / 3);
     const cat = {};
     months.forEach((m, i) => inMonth(m, 'EXPENSE').filter((a) => a.category !== 'Potongan gaji' && a.category !== 'Tabungan dan investasi').forEach((a) => {
       const c = cat[a.category] || (cat[a.category] = { category: a.category, total: 0, seen: new Set() });
-      c.total += a.amount; c.seen.add(i);
+      c.total += Math.abs(R.ledgerAmountValue(a.amount)); c.seen.add(i);
     }));
     const items = Object.values(cat).map((c) => ({ category: c.category, avg: Math.round(c.total / 3), months: c.seen.size, frequent: c.seen.size >= MIN_MONTHS })).sort((a, b) => b.avg - a.avg);
     return { ym, months, withData, ready: withData >= 3 && incomeAvg > 0, incomeAvg, items };

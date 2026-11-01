@@ -20,7 +20,7 @@
     if (loaded[src]) return loaded[src];
     loaded[src] = new Promise((res, rej) => {
       const s = document.createElement('script');
-      s.src = src; s.onload = res; s.onerror = () => { delete loaded[src]; rej(new Error('Gagal memuat mesin baca. Periksa koneksi lalu coba lagi.')); };
+      s.src = src; s.onload = res; s.onerror = () => { delete loaded[src]; rej(new Error('Gagal memuat berkas ' + String(src).split('/').slice(-2).join('/'))); };
       document.head.append(s);
     });
     return loaded[src];
@@ -45,90 +45,66 @@
     { name: 'data bahasa dari memori', core: 'vendor/tesseract/', embed: true },
     { name: 'mode kompatibilitas', core: 'vendor/tesseract/tesseract-core-lstm-lowmem.wasm.js', embed: true }
   ];
+  const LANGS = ['eng', 'ind'];
   const STALL_MS = 20000;
   const STAGE_LABEL = (st) => /core/.test(st) ? 'memuat inti' : /initializing tesseract/.test(st) ? 'menyalakan WebAssembly' : /language/.test(st) ? 'memuat data bahasa' : /initializing api/.test(st) ? 'menyiapkan pembaca teks' : 'memulai';
   // Cara menyalakan mesin yang terakhir berhasil diingat antar-peluncuran, agar tidak mengulang cara yang gagal di perangkat ini.
   const prefStore = () => { try { return root.KHNativeStorage || root.localStorage || null; } catch (e) { return null; } };
   const loadStrat = () => { try { const n = Number(prefStore() && prefStore().getItem('kh_ocr_strategy')); return Number.isInteger(n) && n >= 0 && n < STRATEGIES.length ? n : 0; } catch (e) { return 0; } };
   const saveStrat = (n) => { try { const st = prefStore(); if (st && String(st.getItem('kh_ocr_strategy')) !== String(n)) st.setItem('kh_ocr_strategy', String(n)); } catch (e) { /* tidak penting */ } };
-  let stratIdx = 0, worker = null, workerPromise = null, progressCb = null, nativeWorkerBlobUrl = null;
+  let stratIdx = 0, worker = null, workerPromise = null, progressCb = null;
   const b64OfBuffer = (buf) => { const u = new Uint8Array(buf); let out = ''; for (let i = 0; i < u.length; i += 0x8000) out += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(out); };
-  const nativeOcrBridge = () => {
-    const bridge = root.KHNativeStorage;
-    return bridge && typeof bridge.readOcrAssetBase64 === 'function' ? bridge : null;
-  };
-  /** Android path: read the OCR runtime from APK assets using the native bridge.
-   *  WebView worker fetches are not reliable on every device/vendor; no appassets URL or
-   *  network permission is needed for language data, worker code, or the wasm core. */
-  async function startNativeEngine(logger) {
-    const bridge = nativeOcrBridge();
-    if (!bridge) throw new Error('Jembatan aset OCR Android tidak tersedia. Perbarui aplikasi KasHarian.');
-    await loadScript(abs('vendor/tesseract/tesseract.min.js'));
-    const read = (name) => {
-      const value = bridge.readOcrAssetBase64(name);
-      if (typeof value !== 'string' || value.length < 100) throw new Error('Aset OCR di APK tidak lengkap: ' + name + '. Pasang ulang APK KasHarian.');
-      return value;
-    };
-    if (typeof bridge.hasOcrAssets === 'function' && !bridge.hasOcrAssets()) {
-      throw new Error('Paket OCR di APK tidak lengkap. Buat ulang dan pasang APK KasHarian terbaru.');
-    }
-    const coreName = hasSimd() ? 'tesseract-core-simd-lstm.wasm.js' : 'tesseract-core-lstm-lowmem.wasm.js';
-    logger({ status: 'Memuat data OCR dari aplikasi', progress: 0 });
-    const eng = read('eng.traineddata.gz');
-    logger({ status: 'Memuat bahasa Indonesia', progress: 0.25 });
-    const ind = read('ind.traineddata.gz');
-    logger({ status: 'Menyiapkan inti OCR', progress: 0.5 });
-    const core = bytesFromB64(read(coreName));
-    const workerSource = bytesFromB64(read('worker.min.js'));
-    const parts = workerParts(core, workerSource, eng, ind);
-    const blobUrl = URL.createObjectURL(new Blob(parts, { type: 'text/javascript' }));
-    try {
-      const result = await new Promise((resolve, reject) => {
-        let settled = false, last = Date.now(), stage = 'memulai OCR lokal';
-        const finishError = (error) => {
-          if (settled) return;
-          settled = true;
-          clearInterval(timer);
-          reject(error instanceof Error ? error : new Error(String(error)));
-        };
-        const timer = setInterval(() => {
-          if (Date.now() - last > STALL_MS) finishError(new Error('Mesin OCR berhenti pada tahap ' + stage + '. Coba tutup aplikasi lain lalu ulangi pemindaian.'));
-        }, 1000);
-        const log = (message) => {
-          last = Date.now();
-          stage = STAGE_LABEL(String(message && message.status || stage));
-          logger(message);
-        };
-        try {
-          root.Tesseract.createWorker('ind+eng', 1, {
-            workerPath: blobUrl,
-            workerBlobURL: false,
-            langPath: 'https://kasharian.invalid/tessdata',
-            gzip: true,
-            cacheMethod: 'none',
-            logger: log,
-            errorHandler: finishError
-          }).then((created) => {
-            if (settled) { try { created.terminate(); } catch (_) {} return; }
-            settled = true;
-            clearInterval(timer);
-            resolve(created);
-          }, finishError);
-        } catch (error) {
-          finishError(error);
-        }
-      });
-      nativeWorkerBlobUrl = blobUrl;
-      return result;
-    } catch (error) {
-      URL.revokeObjectURL(blobUrl);
-      throw error;
-    }
-  }
   /** Skrip worker (blob) yang menyajikan file bahasa dari memori lalu memuat worker Tesseract: tidak ada fetch dari dalam worker. */
+  const errText = (e) => String((e && e.message) || e || 'error').slice(0, 120);
+  const nativeBridge = () => { try { return root.KHNativeStorage || null; } catch (e) { return null; } };
+  /** Laporan singkat isi APK (hanya di aplikasi Android) untuk pesan error; kosong di peramban. */
+  function nativeReport() {
+    try { const b = nativeBridge(); return b && typeof b.tessdataReport === 'function' ? String(b.tessdataReport() || '').slice(0, 400) : ''; } catch (e) { return ''; }
+  }
+  /** Data bahasa (gzip) dalam base64. Tiga jalur, dicoba berurutan:
+   *  1) skrip vendor/tessdata/<bahasa>.b64.js. Berkas .js terbukti selalu bisa dimuat WebView Android, sedangkan .gz pernah 404.
+   *  2) fetch berkas .traineddata.gz / .traineddata (cara biasa di peramban).
+   *  3) jembatan native (membaca langsung dari APK). */
+  const langCache = {};
+  async function langB64(name) {
+    if (langCache[name]) return langCache[name];
+    const why = [];
+    try {
+      const T = root.KH_TESSDATA = root.KH_TESSDATA || {};
+      if (!(T[name] && T[name].length > 1000)) await loadScript(abs('vendor/tessdata/' + name + '.b64.js'));
+      if (T[name] && T[name].length > 1000) return (langCache[name] = T[name]);
+      why.push('skrip kosong');
+    } catch (e) { why.push('skrip: ' + errText(e)); }
+    for (const ext of ['.traineddata.gz', '.traineddata']) {
+      try {
+        const r = await fetch(abs('vendor/tessdata/' + name + ext));
+        if (!r.ok) throw new Error('kode ' + r.status);
+        const buf = await r.arrayBuffer();
+        if (buf.byteLength < 1000) throw new Error('berkas terlalu kecil');
+        return (langCache[name] = b64OfBuffer(buf));
+      } catch (e) { why.push(ext + ': ' + errText(e)); }
+    }
+    try {
+      const b = nativeBridge();
+      const v = b && typeof b.readTessdata === 'function' ? b.readTessdata(name) : null;
+      if (v && v.length > 1000) return (langCache[name] = String(v));
+      why.push('native: tidak ada');
+    } catch (e) { why.push('native: ' + errText(e)); }
+    throw new Error('Gagal memuat data bahasa ' + name + ' (' + why.join('; ') + ')');
+  }
+  /** Apakah berkas .gz bisa diambil lewat alamat biasa (yang dipakai worker Tesseract pada mode standar)? Dicek sekali. */
+  let gzOk = null;
+  async function gzReachable() {
+    if (gzOk !== null) return gzOk;
+    try {
+      const rs = await Promise.all(LANGS.map((n) => withTimeout(fetch(abs('vendor/tessdata/' + n + '.traineddata.gz')), 10000, 'waktu habis')));
+      gzOk = rs.every((r) => r.ok);
+      rs.forEach((r) => { try { r.body && r.body.cancel && r.body.cancel(); } catch (e) { /* tidak penting */ } });
+    } catch (e) { gzOk = false; }
+    return gzOk;
+  }
   async function langWorkerUrl(workerUrl) {
-    const get = async (name) => { const r = await fetch(abs('vendor/tessdata/' + name + '.traineddata.gz')); if (!r.ok) throw new Error('Gagal memuat ' + name + ' (' + r.status + ')'); return b64OfBuffer(await r.arrayBuffer()); };
-    const [eng, ind] = [await get('eng'), await get('ind')];
+    const [eng, ind] = [await langB64('eng'), await langB64('ind')];
     const head = '(function(){var D={eng:"', mid = '",ind:"', tail = '"};var f=self.fetch;self.fetch=function(u,o){var n=String(u).split("?")[0].split("/").pop().toLowerCase(),m=/^([a-z_]+)\\.traineddata(?:\\.gz)?$/.exec(n);if(m&&D[m[1]]){var b=atob(D[m[1]]),a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return Promise.resolve(new Response(a,{status:200}));}return f.apply(self,arguments);};})();\nimportScripts(' + JSON.stringify(workerUrl) + ');';
     return URL.createObjectURL(new Blob([head, eng, mid, ind, tail], { type: 'text/javascript' }));
   }
@@ -152,12 +128,8 @@
     if (!workerPromise) {
       workerPromise = (async () => {
         const logger = (m) => { if (progressCb) progressCb(m); };
-        const nativeBridge = nativeOcrBridge();
-        if (!hasSimd() && !embedded() && !nativeBridge) throw new Error('Peramban ini belum mendukung WebAssembly SIMD yang dibutuhkan mesin baca. Perbarui Chrome/Firefox atau gunakan perangkat yang mendukung; data Anda tidak berubah.');
-        if (nativeBridge) {
-          worker = await startNativeEngine(logger);
-          stratIdx = 0;
-        } else if (embedded()) {
+        if (!hasSimd()) throw new Error('Peramban ini belum mendukung WebAssembly SIMD yang dibutuhkan mesin baca. Perbarui Chrome/Firefox atau gunakan perangkat yang mendukung; data Anda tidak berubah.');
+        if (embedded()) {
           if (!root.Tesseract) throw new Error('Mesin baca tidak tersedia di halaman ini.');
           const el = (id) => { const node = document.getElementById(id); return node ? node.textContent.trim() : ''; };
           const eng = el('kh-lang'), ind = el('kh-lang-ind');
@@ -169,6 +141,9 @@
           const errs = []; stratIdx = loadStrat();
           for (let k = 0; k < STRATEGIES.length && !worker; k++) {
             const idx = (stratIdx + k) % STRATEGIES.length, st = STRATEGIES[idx];
+            // Mode standar membuat worker mengambil berkas .gz lewat alamat web. Bila alamat itu tidak terbaca (404 di beberapa build/WebView),
+            // jangan buang waktu menyalakan mesin yang pasti gagal: langsung pakai mode yang membawa data bahasa dari memori.
+            if (!st.embed && !(await gzReachable())) { errs.push(st.name + ': dilewati (berkas bahasa .gz tidak terbaca dari APK)'); continue; }
             try {
               if (k > 0 && progressCb) progressCb({ status: 'kompatibilitas', progress: 0 });
               worker = await startEngine(st, logger);
@@ -177,7 +152,8 @@
           }
           if (!worker) {
             const ver = /Chrome\/([\d.]+)/.exec((root.navigator && navigator.userAgent) || '');
-            throw new Error('Mesin baca tidak bisa dijalankan di perangkat ini. Rincian: ' + errs.join(' | ') + (ver ? ' [WebView ' + ver[1] + ']' : ''));
+            const rep = nativeReport();
+            throw new Error('Mesin baca tidak bisa dijalankan di perangkat ini. Rincian: ' + errs.join(' | ') + (rep ? ' | APK: ' + rep : '') + (ver ? ' [WebView ' + ver[1] + ']' : ''));
           }
         }
         return worker;
@@ -369,7 +345,6 @@
   async function resetWorker() {
     const w = worker; worker = null; workerPromise = null; curMode = null;
     if (w) { try { await w.terminate(); } catch (e) { /* sudah mati */ } }
-    if (nativeWorkerBlobUrl) { try { URL.revokeObjectURL(nativeWorkerBlobUrl); } catch (e) {} nativeWorkerBlobUrl = null; }
   }
   const shrink = (canvas, f) => { const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(canvas.width * f)); c.height = Math.max(1, Math.round(canvas.height * f)); const x = c.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(canvas, 0, 0, c.width, c.height); return c; };
   async function recognizeOnce(canvas, mode) {
@@ -499,9 +474,7 @@
 
   /** Honest readiness report, shown on the slip screen. */
   async function selfTest() {
-    const bridge = nativeOcrBridge();
-    const nativeAssets = !!(bridge && (typeof bridge.hasOcrAssets !== 'function' || bridge.hasOcrAssets()));
-    const r = { embedded: embedded(), nativeOcr: !!bridge, nativeAssets, wasm: typeof WebAssembly === 'object', simd: hasSimd(), worker: false, unzip: typeof DecompressionStream !== 'undefined' };
+    const r = { embedded: embedded(), wasm: typeof WebAssembly === 'object', simd: hasSimd(), worker: false, unzip: typeof DecompressionStream !== 'undefined' };
     try {
       const u = URL.createObjectURL(new Blob(['postMessage(1)'], { type: 'text/javascript' }));
       r.worker = await new Promise((res) => {
@@ -509,10 +482,10 @@
         try { w = new Worker(u); w.onmessage = () => { clearTimeout(t); w.terminate(); res(true); }; w.onerror = () => { clearTimeout(t); res(false); }; } catch (e) { clearTimeout(t); res(false); }
       });
     } catch (e) { r.worker = false; }
-    r.photoOcr = r.wasm && (r.simd || r.nativeOcr) && r.worker && (!r.nativeOcr || r.nativeAssets);
+    r.photoOcr = r.wasm && r.simd && r.worker;
     return r;
   }
 
 
-  root.KHOCR = { reset: resetWorker, readFiles, readFile: (f, s) => readFiles([f], s), selfTest, _workerParts: workerParts, _bytesFromB64: bytesFromB64 };
+  root.KHOCR = { reset: resetWorker, readFiles, readFile: (f, s) => readFiles([f], s), selfTest, _workerParts: workerParts, _bytesFromB64: bytesFromB64, _getWorker: getWorker };
 })(typeof self !== 'undefined' ? self : this);
