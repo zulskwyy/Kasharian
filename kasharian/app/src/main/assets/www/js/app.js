@@ -5,7 +5,7 @@
   const R = KHRules, S = KHStore, { h, toast, modal, confirmBox, pinPad, moneyInput } = KHUI;
   const $app = document.getElementById('app');
   const db = () => S.db;
-  const VERSION = '1.0.8';
+  const VERSION = '1.0.9';
 
   // ---------- state ----------
   const session = { unlocked: false, email: null, flow: null };
@@ -202,20 +202,25 @@
   /** Ask before crossing the monthly planned spending limit. Candidates are not
    * written until the entire batch has been authorized, avoiding partial imports. */
   async function authorizeActivities(candidates) {
-    const all = (candidates || []).filter((x) => x && (x.type === 'INCOME' || x.type === 'EXPENSE'));
+    const all = (candidates || []).filter((x) => x && (x.type === 'INCOME' || x.type === 'EXPENSE' || x.type === 'TRANSFER'));
     // Project wallet balances in entry order before budget checks so a batch cannot
     // silently create a negative wallet balance. Income should be recorded first.
     const currentBalances = R.BalanceEngine.balances(db().wallets, liveActs()), projected = {}, walletShortfalls = [];
     const projectionOrder = all.slice().sort((a, b) => {
       const monthOrder = R.monthOf(a.occurredOn || R.todayISO()).localeCompare(R.monthOf(b.occurredOn || R.todayISO()));
       if (monthOrder) return monthOrder;
-      const priority = (x) => x.type === 'INCOME' ? 0 : 1;
+      const priority = (x) => x.type === 'INCOME' ? 0 : x.type === 'TRANSFER' ? 1 : 2;
       return priority(a) - priority(b) || String(a.occurredOn || '').localeCompare(String(b.occurredOn || ''));
     });
     for (const x of projectionOrder) {
       if (!x.walletId) continue; // a new wallet may be created by the import handler
       if (!(x.walletId in projected)) projected[x.walletId] = Number(currentBalances[x.walletId]) || 0;
       const amount = Math.abs(R.ledgerAmountValue(x.amount));
+      if (x.type === 'TRANSFER') {   // pindah dana hanya memindahkan saldo antar dompet; pengecekan saldo sumbernya dilakukan saat ditulis
+        if (!x.toWalletId) continue;
+        if (!(x.toWalletId in projected)) projected[x.toWalletId] = Number(currentBalances[x.toWalletId]) || 0;
+        projected[x.walletId] -= amount; projected[x.toWalletId] += amount; continue;
+      }
       if (x.type === 'INCOME') projected[x.walletId] += amount;
       else {
         const available = Math.max(0, projected[x.walletId]);
@@ -316,6 +321,8 @@
         const x = unfunded[0];
         await modal({ title: 'Saldo dompet tidak cukup', tone: 'warn', body: [
           h('p', null, `${walletName(x.item.walletId)} memiliki ${R.rupiah(x.available)}, transaksi ${R.rupiah(Math.max(0, R.ledgerAmountValue(x.item.amount)))}.`),
+          (() => { const b = R.BalanceEngine.balances(db().wallets, liveActs()), rest = activeWallets().filter((w) => w.id !== x.item.walletId).map((w) => [w.name, Math.max(0, Number(b[w.id]) || 0)]).filter((v) => v[1] > 0);
+            return rest.length ? h('p', null, 'Saldo dompet lain di KasHarian: ' + rest.map(([n, v]) => `${n} ${R.rupiah(v)}`).join(', ') + '. Pilih dompet itu, atau periksa apakah ada transfer ke rekening sendiri yang tercatat sebagai pengeluaran (ubah jadi Pindah dana).') : null; })(),
           h('p', null, 'Pilih dompet dengan saldo cukup atau catat pemasukan terlebih dahulu.')], buttons: [{ label: 'Kembali', kind: 'primary', value: false }] });
         return false;
       }

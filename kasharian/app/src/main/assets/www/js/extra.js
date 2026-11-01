@@ -607,9 +607,21 @@
     const e = EW_TOPUP.exec(desc || ''); return e ? ((e[1] || e[2] || e[3]) + ' ' + (e[4] || '').replace(/\s/g, '')).toLowerCase().trim() : '';
   };
   const isMine = (r) => { const t = ((r.desc || '') + ' ' + (r.sub || '')).toLowerCase(), a = acctOf(t); return IDS().mine.some((m) => (m.name && nameOf(r.desc).includes(m.name)) || (m.acct && a && a === m.acct)); };
+  /** Nama penerima transfer sama dengan nama pemilik aplikasi -> rekening sendiri. 2 = pasti, 1 = mirip (minta konfirmasi), 0 = bukan. */
+  const nameTokens = (t) => String(t || '').toLowerCase().split(/[^a-z]+/).filter((x) => x.length > 2);
+  function selfMatch(name) {
+    const mine = nameTokens(db().profile && db().profile.name), other = new Set(nameTokens(name));
+    if (!mine.length || !other.size) return 0;
+    const shared = mine.filter((t) => other.has(t)).length;
+    if (shared >= 2 && shared >= Math.min(2, mine.length)) return 2;
+    return mine.length === 1 && shared === 1 ? 1 : 0;
+  }
   function classify(r, ownerTokens) {
     const d = r.desc.toLowerCase(), mem = db().memory.slice().sort((a, b) => b.term.length - a.term.length).find((m) => d.includes(m.term));
-    if (isMine(r)) return { kind: 'MOVE', cat: 'Penyesuaian' };
+    if (isMine(r)) return { kind: 'MOVE', cat: 'Penyesuaian', own: true };
+    // Transfer ke nama sendiri didahulukan dari Kamus: Kamus lama bisa saja menyimpannya sebagai pengeluaran dan membuat saldo bocor.
+    const toName = /(?:ditransfer|transfer|kirim)\s+ke\s+(.+)/.exec(d), sm = toName ? selfMatch(toName[1]) : 0;
+    if (sm) return { kind: 'MOVE', cat: 'Penyesuaian', own: true, needsDirectionReview: sm === 1 };
     if (mem) return { kind: mem.kind, cat: mem.category };
     if (/^cashback|^coins? dari/.test(d)) return { kind: 'SKIP', cat: 'Lainnya' };
     // Biaya admin bank: pengeluaran kecil yang pasti, bukan kategori yang perlu ditanyakan.
@@ -625,7 +637,7 @@
     if (!r.neg && /transfer masuk|transfer dari|penerimaan transfer|dana masuk dari rekening/.test(d)) return { kind: 'MOVE', cat: 'Penyesuaian' };
     const tf = /(?:ditransfer|transfer|kirim)\s+ke\s+(.+)/.exec(d);
     if (tf) {
-      if (ownerTokens.length && ownerTokens.every((t) => tf[1].includes(t))) return { kind: 'MOVE', cat: 'Penyesuaian' };
+      if (ownerTokens.length && ownerTokens.every((t) => tf[1].includes(t))) return { kind: 'MOVE', cat: 'Penyesuaian', own: true };
       return { kind: 'EXPENSE', cat: /laznas|zakat|infaq|sedekah|yatim|donasi|masjid|panti/.test(tf[1]) ? 'Donasi dan sedekah' : 'Keluarga' };
     }
     if (!r.neg) return { kind: 'INCOME', cat: 'Lainnya' };
@@ -645,10 +657,15 @@
     }
     if (/top\s*-?up|isi\s*saldo/.test(t) && !r.neg) {
       const bank = ws.filter((w) => w.type === 'BANK');
-      return bank.length === 1 ? bank[0].id : '';
+      if (bank.length === 1) return bank[0].id;
     }
     const byName = ws.find((w) => (w.name || '').toLowerCase().trim() && t.includes(w.name.toLowerCase().trim()));
     if (byName) return byName.id;
+    // Rekening sendiri: bila hanya ada satu dompet biasa lain, itu pasangannya (tetap bisa diganti di daftar).
+    if (r.own || /top\s*-?up|isi\s*saldo/.test(t)) {
+      const regs = ws.filter((w) => w.type !== 'SAVINGS' && w.type !== 'EMERGENCY' && w.type !== 'CASH' && !/^(tunai|kas|cash)(\s|$)/i.test(w.name || ''));
+      if (regs.length === 1) return regs[0].id;
+    }
     // Never silently pair a transfer with the first arbitrary wallet.
     return '';
   }
@@ -702,12 +719,12 @@
         else { kind = 'MOVE'; cat = 'Pindah dana'; partner = salary.walletId; hint = `Cocok dengan pemasukan slip gaji ${R.rupiah(salary.amount)} (${R.formatDate(salary.occurredOn)}). Akan dicatat sebagai pindah dana, bukan pemasukan baru.`; }
       }
       return { ...x, hint, convertId: conv ? old.id : null, partner, originActivityId, id: S.uid(), kind, cat,
-        orig: { kind: c.kind, cat: c.cat }, dupe, uncertain: !!c.uncertain, needsDirectionReview: !!c.needsDirectionReview, salaryMatchId: salary ? salary.id : null };
+        orig: { kind: c.kind, cat: c.cat }, dupe, own: !!c.own, uncertain: !!c.uncertain, needsDirectionReview: !!c.needsDirectionReview, salaryMatchId: salary ? salary.id : null };
     });
     rows.forEach((row) => { if (row.kind === 'MOVE' && !row.partner) row.partner = guessPartner(row, targetWallet === 'new' ? null : targetWallet); });
     const cg = {}; rows.forEach((x) => { const nm = nameOf(x.desc); if (!nm || x.kind === 'SKIP') return; cg[nm] = cg[nm] || { name: nm, acct: '', n: 0, total: 0 }; cg[nm].n++; cg[nm].total += x.amt; if (!cg[nm].acct) cg[nm].acct = acctOf(x.sub); });
     const known = IDS(), cands = Object.values(cg).filter((c) => (c.n >= 2 || EW_TOPUP.test(c.name)) && !known.mine.some((m) => m.name === c.name || (c.acct && m.acct === c.acct)) && !known.notMine.includes(c.name));
-    STM = { rows, coinPart: st.header.coinsUsed != null ? st.header.coinsUsed - coinOut : null, coins: st.rows.length - rp.length, header: st.header, sumPos, sumNeg, provider: st.provider, wallet: targetWallet, cands, imageUrl: r.res && r.res.imageUrl, ocrText: (r.res && r.res.words || []).map((w) => w.text).filter(Boolean).join(' ') };
+    STM = { rows, skipped: st.skipped || [], coinPart: st.header.coinsUsed != null ? st.header.coinsUsed - coinOut : null, coins: st.rows.length - rp.length, header: st.header, sumPos, sumNeg, provider: st.provider, wallet: targetWallet, cands, imageUrl: r.res && r.res.imageUrl, ocrText: (r.res && r.res.words || []).map((w) => w.text).filter(Boolean).join(' ') };
   }
   const KIND_LABEL = { EXPENSE: 'Keluar', INCOME: 'Masuk', MOVE: 'Pindah dana', SKIP: 'Abaikan' };
   SCREENS.statement = () => {
@@ -715,7 +732,7 @@
     const st = STM, sum = h('div'), list = h('div'), candBox = h('div'); let filter = 'ALL';
     const drawCands = () => candBox.replaceChildren(...(st.cands || []).map((c) => card(h('h3', null, 'Rekening milik Anda?'),
       h('p', null, `Transfer ke ${c.name}${c.acct ? ' (rek. ' + c.acct + ')' : ''} muncul ${c.n} kali, total ${R.rupiah(c.total)}. Kalau ini rekening atau dompet Anda sendiri, semuanya dihitung pindah dana, bukan pengeluaran. Jawaban diingat untuk impor berikutnya.`),
-      h('div', { class: 'row' }, h('button', { class: 'btn primary sm', onclick: () => { IDS().mine.push({ name: c.name, acct: c.acct }); S.save(); st.rows.forEach((r) => { if (r.kind !== 'SKIP' && isMine(r)) { r.kind = 'MOVE'; r.cat = 'Penyesuaian'; r.needsDirectionReview = false; r.partner = guessPartner(r, st.wallet); } }); st.cands = st.cands.filter((x) => x !== c); drawCands(); drawList(); drawSum(); } }, 'Ya, milik saya'),
+      h('div', { class: 'row' }, h('button', { class: 'btn primary sm', onclick: () => { IDS().mine.push({ name: c.name, acct: c.acct }); S.save(); st.rows.forEach((r) => { if (r.kind !== 'SKIP' && isMine(r)) { r.kind = 'MOVE'; r.cat = 'Penyesuaian'; r.own = true; r.needsDirectionReview = false; r.partner = guessPartner(r, st.wallet); } }); st.cands = st.cands.filter((x) => x !== c); drawCands(); drawList(); drawSum(); } }, 'Ya, milik saya'),
         h('button', { class: 'btn ghost sm', onclick: () => { IDS().notMine.push(c.name); S.save(); st.cands = st.cands.filter((x) => x !== c); drawCands(); } }, 'Bukan')))));
     const keep = () => st.rows.filter((r) => r.kind !== 'SKIP');
     const total = (k) => st.rows.filter((r) => r.kind === k).reduce((s, r) => s + r.amt, 0);
@@ -724,7 +741,7 @@
       const near = (x) => Math.abs(x - doc) <= tol, exact = got === doc, ok = near(got) || (coin && near(got - coin)), okAlt = alt != null && alt > 0 && near(alt), good = exact || ok || okAlt;
       const title = good ? `${label} cocok` : `${label} beda ${R.rupiah(Math.abs(got - doc))}`;
       const note = exact ? '' : ok ? (coin && !near(got) ? `Selisih ${R.rupiah(coin)} karena sebagian dibayar dengan koin.` : 'Angka di dokumen dibulatkan.')
-        : okAlt ? `Cocok dengan pengeluaran terpilih ${R.rupiah(alt)}; pindah dana tidak dihitung.` : 'Periksa baris yang kurang.';
+        : okAlt ? `Cocok dengan pengeluaran terpilih ${R.rupiah(alt)}; pindah dana tidak dihitung.` : (got > doc ? 'Ada baris berlebih (transaksi gagal, ganda, atau pindah dana). Periksa baris yang ditandai Keluar.' : 'Periksa baris yang kurang.');
       return h('p', { class: (good ? 'ok-text' : 'warn-text') + ' callout' }, h('span', { class: 'cb' }, h('strong', null, title), h('span', null, `Dokumen ${R.rupiah(doc)} · Terbaca ${R.rupiah(got)}${note ? '. ' + note : ''}`)));
     };
     const drawSum = () => {
@@ -732,8 +749,14 @@
       const ex = total('EXPENSE'), cats = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
       sum.replaceChildren(
         card(h('h3', null, `${st.rows.length} transaksi terbaca`), h('div', { class: 'stats' }, [['Keluar', total('EXPENSE'), 'out'], ['Masuk', total('INCOME'), 'in'], ['Pindah dana', total('MOVE'), '']].map(([l, v, c]) => h('div', { class: 'stat' }, h('small', null, l), h('strong', { class: c }, R.rupiah(v))))),
-          recon('Total pemasukan', st.header.in, st.sumPos, 0, st.header.tolIn), recon('Total pengeluaran', st.header.out, st.sumNeg, st.coinPart, st.header.tolOut, total('EXPENSE')),
-          st.coins ? null : null,
+          ...(st.header.months && Object.keys(st.header.months).length
+            ? Object.keys(st.header.months).sort().reverse().flatMap((ym) => {
+              const m = st.header.months[ym], inM = (x) => x.rp && x.date.slice(0, 7) === ym, pos = st.rows.filter((x) => inM(x) && !x.neg).reduce((n, x) => n + x.amt, 0), neg = st.rows.filter((x) => inM(x) && x.neg).reduce((n, x) => n + x.amt, 0),
+                ex = st.rows.filter((x) => x.kind === 'EXPENSE' && inM(x)).reduce((n, x) => n + x.amt, 0), inc = st.rows.filter((x) => x.kind === 'INCOME' && inM(x)).reduce((n, x) => n + x.amt, 0), L = R.monthLabel(ym);
+              return [recon(`Pemasukan ${L}`, m.in, pos, 0, m.tolIn, inc), recon(`Pengeluaran ${L}`, m.out, neg, 0, m.tolOut, ex)];
+            })
+            : [recon('Total pemasukan', st.header.in, st.sumPos, 0, st.header.tolIn), recon('Total pengeluaran', st.header.out, st.sumNeg, st.coinPart, st.header.tolOut, total('EXPENSE'))]),
+          st.skipped && st.skipped.length ? h('p', { class: 'ok-text callout' }, h('span', { class: 'cb' }, h('strong', null, `${st.skipped.length} transaksi gagal dilewati`), h('span', null, st.skipped.map((x) => `${x.desc} ${R.rupiah(x.amt)}`).join(' · ') + '. Transaksi gagal tidak mengubah saldo, jadi tidak dicatat.'))) : null,
           null,
           st.ocrText ? h('details', { class: 'ocr-text-details' }, h('summary', null, 'Lihat semua teks hasil pembacaan'), null, h('textarea', { class: 'input', rows: 6, readOnly: true, value: st.ocrText })) : null),
         card(h('h3', null, 'Pengeluaran per kategori'), cats.length ? h('div', { class: 'list' }, cats.map(([c, v]) => h('div', { class: 'cat-row' }, h('div', { class: 'cat-top' }, h('strong', null, c), h('span', null, `${R.rupiah(v)} (${Math.round(v * 100 / ex)}%)`)), h('div', { class: 'bar' }, h('i', { style: { width: Math.max(2, Math.round(v * 100 / ex)) + '%' } }))))) : h('p', { class: 'empty' }, 'Belum ada pengeluaran terpilih.')),
@@ -811,31 +834,56 @@
       if (unclearCategory) return focusStatementIssue(unclearCategory, 'category', `Pilih kategori untuk “${unclearCategory.desc}”.`);
       const unpaired = rows.find((r) => r.kind === 'MOVE' && (!r.partner || (st.wallet !== 'new' && r.partner === st.wallet)));
       if (unpaired) return focusStatementIssue(unpaired, 'wallet-pair', `Pilih dompet sumber atau tujuan untuk “${unpaired.desc}”.`);
-      let wid = st.wallet;
-      const candidates = rows.filter((r) => r.kind === 'INCOME' || r.kind === 'EXPENSE').map((r) => ({ type: r.kind, amount: r.amt, walletId: wid === 'new' ? null : wid, category: r.cat, occurredOn: r.date, merchant: r.desc.slice(0, 60), source: 'mutasi' }));
-      if (!(await A.authorizeActivities(candidates))) return;
-      const expenseCandidates = candidates.filter((r) => r.type === 'EXPENSE');
-      let ci = 0; rows.forEach((r) => { if (r.kind === 'EXPENSE') { const cd = expenseCandidates[ci++]; r.budgetSavingsUsed = cd.budgetSavingsUsed || 0; r.budgetFreeUsed = cd.budgetFreeUsed || 0; r.budgetTopUp = cd.budgetTopUp || 0; r.budgetSavingsKinds = cd.budgetSavingsKinds || null; r.budgetSavingsByBucket = cd.budgetSavingsByBucket; } });
-      const before = snapMonths(rows.map((r) => r.date));
-      const activitiesBefore = db().activities.map((a) => ({ ...a }));
-      const walletsBeforeSave = db().wallets.map((w) => ({ ...w }));
-      const linksBefore = { ...(db().walletLinks || {}) };
-      const memoryBefore = db().memory.map((m) => ({ ...m }));
-      if (wid === 'new') { wid = S.uid(); db().wallets.push({ id: wid, name: st.provider, type: 'EWALLET', openingBalance: 0, includeInTotal: true, archived: false, createdAt: Date.now() }); }
-      if (st.provider) { db().walletLinks = db().walletLinks || {}; db().walletLinks[st.provider] = wid; }
-      const now = Date.now(); let n = 0, learned = 0, twins = 0;
+      // Foto data sebelum menulis apa pun: bila satu langkah gagal, semuanya dikembalikan dan alasannya ditampilkan (bukan toast yang cepat hilang).
+      const before0 = snapMonths(rows.map((r) => r.date));
+      const snap0 = { acts: db().activities.map((a) => ({ ...a })), wallets: db().wallets.map((w) => ({ ...w })), links: { ...(db().walletLinks || {}) }, mem: db().memory.map((m) => ({ ...m })) };
+      const restore = () => { db().activities = snap0.acts; db().wallets = snap0.wallets; db().walletLinks = snap0.links; db().memory = snap0.mem; S.save(); };
+      const stop = async (msg) => { restore(); await KHUI.notice('Transaksi belum tersimpan', h('p', null, msg), 'error', [{ label: 'Tutup', kind: 'primary', value: false }]); return false; };
+      const sumAll = (m) => Object.values(m).reduce((n, v) => n + (Number(v) || 0), 0);
+      let wid = st.wallet, n = 0, learned = 0, twins = 0;
       try {
-        const priority = (r) => r.kind === 'INCOME' ? 0 : r.kind === 'MOVE' ? 1 : r.kind === 'EXPENSE' ? 2 : 3;
+        if (wid === 'new') { wid = S.uid(); db().wallets.push({ id: wid, name: st.provider, type: 'EWALLET', openingBalance: 0, includeInTotal: true, archived: false, createdAt: Date.now() }); }
+        if (st.provider) { db().walletLinks = db().walletLinks || {}; db().walletLinks[st.provider] = wid; }
+        const priority = (r) => r.kind === 'INCOME' ? 0 : r.kind === 'MOVE' ? (r.neg ? 2 : 1) : r.kind === 'EXPENSE' ? 3 : 4;   // dana masuk dulu, lalu dana keluar, terakhir belanja
         const toWrite = rows.slice().sort((a, b) => R.monthOf(a.date).localeCompare(R.monthOf(b.date)) || priority(a) - priority(b) || a.date.localeCompare(b.date));
+        // Simulasikan saldo semua dompet sesuai urutan tulis. Kekurangan dompet tujuan impor biasanya karena saldo awal belum dicatat: tawarkan penyesuaian.
+        const run = { ...R.BalanceEngine.balances(db().wallets, A.liveActs()) }; let need = 0, bad = null;
+        toWrite.forEach((r) => {
+          const bump = (id, v) => { if (id) run[id] = (run[id] || 0) + v; };
+          if (r.kind === 'INCOME') bump(wid, r.amt); else if (r.kind === 'EXPENSE') bump(wid, -r.amt);
+          else if (r.kind === 'MOVE') { bump(r.neg ? wid : r.partner, -r.amt); bump(r.neg ? r.partner : wid, r.amt); }
+          if (run[wid] < 0) need = Math.max(need, -run[wid]);
+          if (r.partner && r.partner !== wid && run[r.partner] < 0 && !bad) bad = { id: r.partner, short: -run[r.partner] };
+        });
+        if (bad) return await stop(`Saldo dompet ${A.walletName(bad.id)} di KasHarian kurang ${R.rupiah(bad.short)} untuk pindah dana ini. Catat pemasukan ke dompet itu atau pilih dompet pasangan lain, lalu coba lagi.`);
+        let adjusted = 0;
+        if (need > 0) {
+          const ok = await KHUI.modal({ title: 'Saldo awal belum cukup', tone: 'warn', body: [h('p', null, `Saldo ${A.walletName(wid)} di KasHarian lebih kecil ${R.rupiah(need)} dari yang dibutuhkan transaksi ini. Biasanya karena saldo awal dompet belum dicatat.`), h('p', null, 'Tambahkan penyesuaian saldo awal supaya semua transaksi bisa dicatat? Penyesuaian tidak dihitung sebagai pemasukan.')],
+            buttons: [{ label: 'Batal', kind: 'ghost', value: false }, { label: 'Tambahkan penyesuaian', kind: 'primary', value: true }] });
+          if (!ok) { restore(); return; }
+          adjusted = need;
+          A.addActivity({ type: 'ADJUSTMENT', amount: need, walletId: wid, category: 'Penyesuaian', occurredOn: rows.map((r) => r.date).sort()[0], note: 'Penyesuaian saldo awal sebelum impor mutasi', source: 'mutasi-saldo-awal', merchant: 'Saldo awal' });
+        }
+        const candidates = rows.filter((r) => r.kind !== 'SKIP').map((r) => r.kind === 'MOVE'
+          ? { type: 'TRANSFER', amount: r.amt, walletId: r.neg ? wid : r.partner, toWalletId: r.neg ? r.partner : wid, occurredOn: r.date, source: 'mutasi' }
+          : { type: r.kind, amount: r.amt, walletId: wid, category: r.cat, occurredOn: r.date, merchant: r.desc.slice(0, 60), source: 'mutasi', _row: r });
+        if (!(await A.authorizeActivities(candidates))) { restore(); return; }
+        candidates.filter((c) => c._row && c.type === 'EXPENSE').forEach((cd) => { const r = cd._row; r.budgetSavingsUsed = cd.budgetSavingsUsed || 0; r.budgetFreeUsed = cd.budgetFreeUsed || 0; r.budgetTopUp = cd.budgetTopUp || 0; r.budgetSavingsKinds = cd.budgetSavingsKinds || null; r.budgetSavingsByBucket = cd.budgetSavingsByBucket; });
+        const totalBefore = sumAll(R.BalanceEngine.balances(db().wallets, A.liveActs())), now = Date.now();
         toWrite.forEach((r) => {
           if (r.kind === 'MOVE') { if (saveMove(r, wid, now) === 'twin') { twins++; return; } }
           else A.addActivity({ type: r.kind, amount: r.amt, walletId: wid, category: r.cat, occurredOn: r.date, merchant: r.desc.slice(0, 60), note: '', source: 'mutasi', sourceId: r.txId || null, budgetSavingsUsed: r.budgetSavingsUsed || 0, budgetFreeUsed: r.budgetFreeUsed || 0, budgetTopUp: r.budgetTopUp || 0, budgetSavingsKinds: r.budgetSavingsKinds || null, budgetSavingsByBucket: r.budgetSavingsByBucket });
           n++;
           if ((r.kind !== r.orig.kind || r.cat !== r.orig.cat) && (r.kind === 'EXPENSE' || r.kind === 'INCOME')) { learn(r); learned++; }
         });
-      } catch (e) { db().activities = activitiesBefore; db().wallets = walletsBeforeSave; db().walletLinks = linksBefore; db().memory = memoryBefore; S.save(); return toast(e.message); }
-      S.save();
-      STM = null; A.root('home'); toast(`${n} transaksi dicatat` + (twins ? `. ${twins} pindah dana sudah tercatat, tidak digandakan.` : '') + (learned ? `. ${learned} pilihan Anda diingat.` : '')); notify(before);
+        // Penjaga arah saldo: total semua dompet hanya boleh berubah sebesar pemasukan dikurangi pengeluaran (pindah dana tidak mengubah total).
+        const written = toWrite.filter((r) => r.kind === 'INCOME' || r.kind === 'EXPENSE');
+        const expected = written.reduce((t, r) => t + (r.kind === 'INCOME' ? r.amt : -r.amt), 0), delta = sumAll(R.BalanceEngine.balances(db().wallets, A.liveActs())) - totalBefore;
+        if (Math.round(delta) !== Math.round(expected)) throw new Error('Arah saldo tidak sesuai jenis transaksi (Masuk menambah, Keluar mengurangi), jadi catatan dibatalkan. Periksa jenis transaksi lalu coba lagi.');
+        if (!S.save()) throw new Error('Transaksi belum tersimpan ke penyimpanan perangkat. Periksa ruang penyimpanan, lalu coba lagi.');
+        STM = null; A.root('home');
+        toast(`${n} transaksi dicatat` + (adjusted ? `. Penyesuaian saldo awal ${R.rupiah(adjusted)} ditambahkan` : '') + (twins ? `. ${twins} pindah dana sudah tercatat, tidak digandakan.` : '') + (learned ? `. ${learned} pilihan Anda diingat.` : '') + `. Saldo ${A.walletName(wid)}: ${R.rupiah(Math.max(0, R.BalanceEngine.balances(db().wallets, A.liveActs())[wid] || 0))}`, { ms: 6500 }); notify(before0);
+      } catch (e) { await stop(e.message || 'Terjadi kesalahan saat menyimpan.'); }
     }
     drawSum(); drawList(); drawCands();
     return frame({ title: 'Mutasi dan tagihan', back: true, children: [candBox, sum, list, h('button', { class: 'btn primary block', onclick: save }, 'Catat transaksi terpilih'), h('button', { class: 'btn ghost block', onclick: () => { STM = null; A.back(); } }, 'Batal')] });

@@ -303,7 +303,12 @@
   const HDR_FULL = new RegExp('(?:' + DAYS + '|hari ini|kemarin)?\\s*(\\d{1,2})\\s+(jan|feb|mar|apr|mei|jun|jul|agu|agt|sep|okt|nov|des)[a-z]*\\.?\\s*,?\\s*(20\\d{2})', 'i');
   const HDR_SHORT = new RegExp('^(?:' + DAYS + '|hari ini|kemarin)[\\s,]*(\\d{1,2})\\s+(jan|feb|mar|apr|mei|jun|jul|agu|agt|sep|okt|nov|des)[a-z]*\\.?$', 'i');
   const NAV = /^(beranda|keuangan|qris|riwayat|profil|tanggal|layanan|metode|download|kembali|home|transaksi|semua|filter)(\s|$)/i;
-  const RP_RE = /([-\u2212\u2013\u2014+])?\s*Rp\.?\s*(\d{1,3}(?:[.,]\d{3})+|\d+)(?![\d])/i;
+  // Nominal: ambil semua angka setelah "Rp" lalu buang pemisah. OCR sering menghilangkan atau menggeser titik ribuan ("Rp1150.000" harus 1.150.000, bukan 1.150).
+  const RP_RE = /([-\u2212\u2013\u2014+])?\s*Rp\.?\s*(\d[\d.,]*\d|\d)/i;
+  const rpValue = (txt) => { const d = String(txt || '').replace(/[^\d]/g, ''); return d ? parseInt(d, 10) : 0; };
+  // Status transaksi yang belum/tidak berhasil. Uangnya tidak pernah keluar, jadi baris ini tidak boleh dicatat.
+  const BAD_STATUS = /^(gagal|failed|batal|dibatalkan|dibatalin|canceled|cancelled|ditolak|rejected|kedaluwarsa|kadaluarsa|kedaluarsa|expired|menunggu|pending|diproses|diprosess|processing)$/i;
+  const badStatusWord = (t) => { const w = String(t || '').toLowerCase().replace(/[^a-z0-9]/g, ''); if (!w) return false; if (BAD_STATUS.test(w)) return true; return w.length >= 4 && w.length <= 6 && /^[ga]/.test(w) && lev(w, 'gagal') <= 1; };
   const SUBLINE = /^(bni|bri|bca|mandiri|bsi|bank|gopay|cimb|permata|dana|ovo|\*+)\b.*(\d{4,}|\*{2,})/i;
   const WD = { senin: 1, selasa: 2, rabu: 3, kamis: 4, jumat: 5, sabtu: 6, minggu: 0 };
   const dow = (iso0) => { const [y, m, d] = iso0.split('-').map(Number); return new Date(Date.UTC(y, m - 1, d)).getUTCDay(); };
@@ -327,7 +332,7 @@
   }
   /** "Rp2.55jt" / "Rp4jt" / "Rp62.500" -> {n, tol}. Angka berakhiran jt/rb dibulatkan aplikasi, jadi diberi toleransi setengah digit terakhir. */
   function shortRp(s) {
-    const m = /Rp\.?\s*(\d+(?:[.,]\d+)*)\s*(jt|juta|rb|ribu)?/i.exec(s || ''); if (!m) return null;
+    const m = /Rp\.?\s*(\d+(?:[.,]\d+)*)\s*(jt|juta|rb|ribu)?/i.exec(String(s || '').replace(/Rp\.?\s*[Oo](?![A-Za-z])/g, 'Rp0')); if (!m) return null;
     if (m[2]) { const mult = /^j/i.test(m[2]) ? 1e6 : 1e3, num = m[1].replace(',', '.'), dec = (num.split('.')[1] || '').length; return { n: Math.round(parseFloat(num) * mult), tol: Math.round(0.5 * Math.pow(10, -dec) * mult) }; }
     return { n: parseInt(m[1].replace(/[.,]/g, ''), 10), tol: 0 };
   }
@@ -343,35 +348,47 @@
     if (lines.length < 4) return null;
     const rpx = words.filter((w) => /^[-\u2212\u2013\u2014+]?Rp\.?\d/i.test(w.text.trim())).map((w) => w.x0).sort((a, b) => a - b);
     const cut = rpx.length >= 2 ? Math.min(rpx[Math.floor(rpx.length * 0.1)], maxX * 0.75) - medH * 0.5 : maxX * 0.5; let date = null; const groups = new Set();
-    const heads = [], anchors = [], frags = [], sums = { out: null, in: null };
+    const heads = [], anchors = [], frags = [], sums = { out: null, in: null }, monthSums = {}; let pend = null;
     for (const l of lines) {
       const txt = l.text.replace(/\s+/g, ' ');
-      if (/(pengeluaran|pemasukan)\s*:/i.test(txt)) { const hs = headerSums(txt); if (hs.out) sums.out = hs.out; if (hs.in) sums.in = hs.in; continue; }
+      if (/(pengeluaran|pemasukan)\s*:/i.test(txt)) { const hs = headerSums(txt); if (hs.out) sums.out = hs.out; if (hs.in) sums.in = hs.in; pend = { out: hs.out || (pend && pend.out) || null, in: hs.in || (pend && pend.in) || null }; continue; }
       const hd = headerOf(l, txt, heads.length ? heads[heads.length - 1].date : null, today);
-      if (hd) { heads.push({ yc: l.yc, date: hd }); groups.add(hd); continue; }
+      if (hd) { heads.push({ yc: l.yc, date: hd }); groups.add(hd); if (pend) { monthSums[hd.slice(0, 7)] = pend; pend = null; } continue; }
       const right = l.ws.filter((w) => w.x0 >= cut), left = l.ws.filter((w) => w.x0 < cut);
       const rt = right.map((w) => w.text).join(' ').replace(/\s*([.,])\s*/g, '$1'), rm = RP_RE.exec(rt);
       if (rm) {
         const hasHead = heads.length; if (!hasHead) continue;
-        anchors.push({ yc: l.yc, neg: !!(rm[1] && rm[1] !== '+'), plus: rm[1] === '+', n: parseInt(rm[2].replace(/[.,]/g, ''), 10), date: heads[heads.length - 1].date, h: heads.length });
+        anchors.push({ yc: l.yc, neg: !!(rm[1] && rm[1] !== '+'), plus: rm[1] === '+', n: rpValue(rm[2]), date: heads[heads.length - 1].date, h: heads.length });
       }
-      const lt = left.map((w) => w.text).join(' ').replace(/\s+/g, ' ').trim(), rtOnly = !rm ? right.map((w) => w.text).join(' ') : '';
-      if (lt && heads.length) frags.push({ yc: l.yc, text: lt, h: heads.length, method: '' });
-      if (!rm && rtOnly && /(saldo|coins?|poin|gopay|ovo|dana|shopeepay)/i.test(rtOnly) && frags.length === 0) { /* abaikan */ }
+      const lt = left.map((w) => w.text).join(' ').replace(/\s+/g, ' ').trim();
+      if (lt && heads.length) frags.push({ yc: l.yc, text: lt, ws: left, h: heads.length, method: '' });
+      // Kata status di kolom kanan (tanpa nominal) juga dipantau.
+      const rightBad = right.filter((w) => !RP_RE.test(w.text) && badStatusWord(w.text));
+      if (rightBad.length && heads.length) frags.push({ yc: l.yc, text: '', ws: [], bad: true, h: heads.length, method: '' });
     }
     if (anchors.length < 2 || !heads.length) return null;
     const docMinus = anchors.filter((a) => a.neg).length >= 2;
     const used = new Map(); anchors.forEach((a) => used.set(a, []));
+    // Kolom keterangan: ikon di kiri (huruf/angka sisa gambar seperti "a", "3,", "Li", "[+]") bukan bagian nama transaksi.
+    const lead = frags.filter((f) => f.ws && f.ws.length && !f.bad).map((f) => f.ws[0].x0), bin = Math.max(6, medH * 0.7), hist = {};
+    lead.forEach((x) => { const k = Math.round(x / bin); hist[k] = (hist[k] || 0) + 1; });
+    const topK = Object.keys(hist).sort((p, q) => hist[q] - hist[p])[0], descX = lead.length >= 3 && topK != null ? Number(topK) * bin : null;
+    const cleanWords = (ws) => ws.filter((w) => !(descX != null && w.x1 <= descX - medH * 0.35)).filter((w, i, a) => /[A-Za-z0-9\u00C0-\u024F]/.test(w.text) || (/^[-\u2013\u2014]$/.test(w.text) && i > 0 && i < a.length - 1));
     for (const f of frags) {
-      if (NAV.test(f.text) || /^(cashback|coins?\s+dari)/i.test(f.text) || /^(gopay\s+)?(saldo|coins?|poin)\b/i.test(f.text) || /^\d{1,3}$/.test(f.text)) continue;
+      if (!f.bad) {
+        const kept = cleanWords(f.ws || []); f.badWord = kept.some((w, i) => badStatusWord(w.text) && (kept.length === 1 || i === kept.length - 1));
+        f.text = kept.filter((w) => !(f.badWord && badStatusWord(w.text))).map((w) => w.text).join(' ').replace(/\s+/g, ' ').trim();
+      } else f.badWord = true;
+      if (!f.badWord && (!f.text || NAV.test(f.text) || /^(cashback|coins?\s+dari)/i.test(f.text) || /^(gopay\s+)?(saldo|coins?|poin)\b/i.test(f.text) || /^\d{1,3}$/.test(f.text))) continue;
       let best = null; for (const a of anchors) { if (a.h !== f.h) continue; const d = Math.abs(a.yc - f.yc); if (d <= medH * 3.2 && (!best || d < best.d)) best = { a, d }; }
       if (best) used.get(best.a).push(f);
     }
-    const seen = {}, rows = [];
+    const seen = {}, rows = [], skipped = [];
     anchors.forEach((a) => {
-      const fr = used.get(a).sort((p, q) => p.yc - q.yc), main = fr.filter((f) => !SUBLINE.test(f.text)), sub = fr.filter((f) => SUBLINE.test(f.text));
+      const fr = used.get(a).sort((p, q) => p.yc - q.yc), failed = fr.some((f) => f.badWord), real = fr.filter((f) => f.text), main = real.filter((f) => !SUBLINE.test(f.text)), sub = real.filter((f) => SUBLINE.test(f.text));
       const desc = main.map((f) => f.text).join(' ').replace(/\s+/g, ' ').trim();
-      const pos = /(top\s*-?up|isi\s*saldo|diterima|terima\s+dari|refund|pengembalian|gaji|masuk)/i.test(desc);
+      if (failed) { skipped.push({ date: a.date, desc: desc || 'Transaksi', amt: a.n, reason: 'gagal' }); return; }
+      const pos = /(top\s*-?up|isi\s*saldo|diterima|terima\s+dari|menerima|refund|pengembalian|dikembalikan|gaji|masuk|bonus|hadiah|bunga)/i.test(desc);
       const neg = a.neg || (!a.plus && (docMinus ? !pos : !pos && /(bayar|ditransfer|transfer ke|tarik|beli|pembayaran|tagihan)/i.test(desc)));
       const key = a.date + '|' + desc.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24) + '|' + a.n; seen[key] = (seen[key] || 0) + 1;
       rows.push({ date: a.date, time: '', desc: desc || 'Transaksi', sub: sub.map((f) => f.text).join(' '), txId: 'layar:' + key + '#' + seen[key], method: '', neg, rp: true, amt: a.n, noDesc: !desc, hint: desc ? '' : 'Keterangan tidak terbaca; baris mungkin terpotong di tepi tangkapan layar. Periksa jenis dan nominalnya.' });
@@ -381,7 +398,7 @@
     // nama tujuan yang berulang: kemungkinan rekening sendiri
     const names = {}; rows.forEach((r) => { const m = /(?:ditransfer|transfer|kirim)\s+ke\s+(.+)/i.exec(r.desc); if (m) { const k = m[1].toLowerCase(); names[k] = (names[k] || 0) + 1; } });
     rows.forEach((r) => { const m = /(?:ditransfer|transfer|kirim)\s+ke\s+(.+)/i.exec(r.desc); if (m && names[m[1].toLowerCase()] >= 3) r.hint = `Nama ini muncul ${names[m[1].toLowerCase()]} kali. Jika ini rekening Anda sendiri, pilih "Pindah dana".`; });
-    return { rows, header: { in: sums.in ? sums.in.n : null, out: sums.out ? sums.out.n : null, tolIn: sums.in ? sums.in.tol : 0, tolOut: sums.out ? sums.out.tol : 0, coinsUsed: null }, owner: '', provider, source: 'layar' };
+    return { rows, header: { months: Object.fromEntries(Object.entries(monthSums).map(([k, v]) => [k, { in: v.in ? v.in.n : null, out: v.out ? v.out.n : null, tolIn: v.in ? v.in.tol : 0, tolOut: v.out ? v.out.tol : 0 }])), in: sums.in ? sums.in.n : null, out: sums.out ? sums.out.n : null, tolIn: sums.in ? sums.in.tol : 0, tolOut: sums.out ? sums.out.tol : 0, coinsUsed: null }, owner: '', provider, source: 'layar', skipped };
   }
 
   return { shortRp, headerSums, lev, detectBrand, findDate, amountsOf, pickTotal, analyzeReceipt, parseAppList, groupLines, BRANDS };

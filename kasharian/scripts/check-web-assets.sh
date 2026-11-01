@@ -10,6 +10,7 @@ while IFS= read -r -d '' file; do
   node --check "$file" >/dev/null
 done < <(find "$WWW/js" -type f -name '*.js' -print0)
 node "$ROOT/scripts/ledger-regression.test.js"
+node "$ROOT/scripts/history-ocr-regression.test.js"
 node - <<'NODE' "$WWW/js/backup.js"
 (async () => {
   const file = process.argv[2];
