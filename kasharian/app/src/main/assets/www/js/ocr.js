@@ -8,7 +8,7 @@
   const embedded = () => !!root.KH_EMBED;
   const MAX_BYTES = 12 * 1024 * 1024;
   // Gambar terlalu besar membuat OCR di HP berjam-jam; 2000 px sisi panjang cukup untuk struk.
-  const MAX_LONG = 2000, WORKER_INIT_MS = 90000, RECOGNIZE_MS = 120000, ALT_BUDGET_MS = 40000;
+  const MAX_LONG = 2000, WORKER_INIT_MS = 45000, RECOGNIZE_MS = 120000, ALT_BUDGET_MS = 40000;
   const fitScale = (long) => (long > MAX_LONG ? MAX_LONG / long : long < 1200 ? Math.min(2, 1500 / long) : 1);
   const withTimeout = (p, ms, msg) => new Promise((res, rej) => {
     const t = setTimeout(() => rej(Object.assign(new Error(msg), { timeout: true })), ms);
@@ -38,7 +38,8 @@
     return [head, engB64, middle, indB64 || engB64, tail, coreBytes, '\n', workerBytes];
   }
 
-  let worker = null, workerPromise = null, progressCb = null;
+  const CORES = [{ name: 'inti utama', path: 'vendor/tesseract/' }, { name: 'inti cadangan', path: 'vendor/tesseract/tesseract-core-lstm-lowmem.wasm.js' }];
+  let coreIdx = 0, worker = null, workerPromise = null, progressCb = null;
   async function getWorker() {
     if (worker) return worker;
     if (!workerPromise) {
@@ -54,11 +55,24 @@
           worker = await root.Tesseract.createWorker(ind ? 'ind+eng' : 'eng', 1, { workerPath: url, workerBlobURL: false, langPath: 'https://kasharian.invalid/tessdata', gzip: true, cacheMethod: 'none', logger });
         } else {
           await loadScript(abs('vendor/tesseract/tesseract.min.js'));
-          const langs = 'ind+eng';
-          worker = await withTimeout(root.Tesseract.createWorker(langs, 1, { workerPath: abs('vendor/tesseract/worker.min.js'), corePath: abs('vendor/tesseract/'), langPath: abs('vendor/tessdata/'), gzip: true, workerBlobURL: false, cacheMethod: 'none', logger }), WORKER_INIT_MS, 'Mesin baca terlalu lama dimulai. Tutup aplikasi lalu coba lagi.');
+          // Inti WebAssembly dicoba berurutan. Inti utama memakai SIMD; cadangan tanpa SIMD dan dengan batas memori lebih kecil
+          // untuk WebView/perangkat yang menolak inti utama. Kegagalan sekarang dilaporkan (dulu ditelan dan membuat macet selamanya).
+          const errs = [];
+          for (let k = 0; k < CORES.length && !worker; k++) {
+            const idx = (coreIdx + k) % CORES.length, core = CORES[idx];
+            try {
+              if (k > 0 && progressCb) progressCb({ status: 'kompatibilitas', progress: 0 });
+              worker = await withTimeout(root.Tesseract.createWorker('ind+eng', 1, { workerPath: abs('vendor/tesseract/worker.min.js'), corePath: abs(core.path), langPath: abs('vendor/tessdata/'), gzip: true, workerBlobURL: false, cacheMethod: 'none', logger }), WORKER_INIT_MS, 'tidak ada respons dalam ' + Math.round(WORKER_INIT_MS / 1000) + ' detik');
+              coreIdx = idx;
+            } catch (e) { worker = null; errs.push(core.name + ': ' + String(e && e.message || e).slice(0, 280)); }
+          }
+          if (!worker) {
+            const ver = /Chrome\/([\d.]+)/.exec((root.navigator && navigator.userAgent) || '');
+            throw new Error('Mesin baca tidak bisa dijalankan di perangkat ini. Rincian: ' + errs.join(' | ') + (ver ? ' [WebView ' + ver[1] + ']' : ''));
+          }
         }
         return worker;
-      })().catch((e) => { workerPromise = null; throw new Error(e && e.message ? e.message : 'Mesin baca gagal dimulai.'); });
+      })().catch((e) => { workerPromise = null; const msg = e && e.message ? e.message : 'Mesin baca gagal dimulai.'; throw Object.assign(new Error(msg), { fatal: /^Mesin baca tidak bisa|SIMD/.test(msg) }); });
     }
     return workerPromise;
   }
@@ -266,7 +280,7 @@
         const trial = await recognizeOnce(trialScale < 1 ? shrink(canvas, trialScale) : canvas, trialMode);
         if (wordsFromOcr(trial).length) { data = trial; scale = trialScale; }
         else { err = new Error('Belum ada teks yang terbaca pada percobaan ini'); await resetWorker(); }
-      } catch (e) { err = e; await resetWorker(); if (e && e.timeout) break; } // buat ulang worker setelah error; jangan ulang bila sudah kehabisan waktu
+      } catch (e) { err = e; if (e && e.fatal) break; await resetWorker(); if (e && e.timeout) break; } // buat ulang worker setelah error; jangan ulang bila sudah kehabisan waktu
     }
     if (!data) throw new Error('Teks belum berhasil dibaca' + (err && err.message ? ` (${err.message})` : '') + '. Gambar masih dapat disimpan, atau coba JPG/PNG yang lebih jelas.');
     return { words: wordsFromOcr(data).map((x) => ({ ...x, x0: x.x0 / scale, x1: x.x1 / scale, y0: x.y0 / scale + yOffset, y1: x.y1 / scale + yOffset })), confidence: Number(data.confidence) || 0 };
@@ -350,6 +364,7 @@
     progressCb = (m) => {
       if (!onStage) return;
       if (m.status === 'recognizing text') onStage(`Membaca teks ${Math.round(m.progress * 100)}%`);
+      else if (m.status === 'kompatibilitas') onStage('Mencoba mode kompatibilitas');
       else if (/loading|initializ/.test(m.status)) onStage('Menyiapkan mesin baca' + (m.progress != null && m.progress > 0 ? ' ' + Math.round(m.progress * 100) + '%' : ' (sekali saja)'));
     };
     const results = [];
