@@ -20,7 +20,7 @@
     if (loaded[src]) return loaded[src];
     loaded[src] = new Promise((res, rej) => {
       const s = document.createElement('script');
-      s.src = src; s.onload = res; s.onerror = () => { delete loaded[src]; rej(new Error('Gagal memuat mesin baca. Periksa koneksi lalu coba lagi.')); };
+      s.src = src; s.onload = res; s.onerror = () => { delete loaded[src]; rej(new Error('Gagal memuat berkas ' + String(src).split('/').slice(-2).join('/'))); };
       document.head.append(s);
     });
     return loaded[src];
@@ -45,6 +45,7 @@
     { name: 'data bahasa dari memori', core: 'vendor/tesseract/', embed: true },
     { name: 'mode kompatibilitas', core: 'vendor/tesseract/tesseract-core-lstm-lowmem.wasm.js', embed: true }
   ];
+  const LANGS = ['eng', 'ind'];
   const STALL_MS = 20000;
   const STAGE_LABEL = (st) => /core/.test(st) ? 'memuat inti' : /initializing tesseract/.test(st) ? 'menyalakan WebAssembly' : /language/.test(st) ? 'memuat data bahasa' : /initializing api/.test(st) ? 'menyiapkan pembaca teks' : 'memulai';
   // Cara menyalakan mesin yang terakhir berhasil diingat antar-peluncuran, agar tidak mengulang cara yang gagal di perangkat ini.
@@ -54,9 +55,56 @@
   let stratIdx = 0, worker = null, workerPromise = null, progressCb = null;
   const b64OfBuffer = (buf) => { const u = new Uint8Array(buf); let out = ''; for (let i = 0; i < u.length; i += 0x8000) out += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(out); };
   /** Skrip worker (blob) yang menyajikan file bahasa dari memori lalu memuat worker Tesseract: tidak ada fetch dari dalam worker. */
+  const errText = (e) => String((e && e.message) || e || 'error').slice(0, 120);
+  const nativeBridge = () => { try { return root.KHNativeStorage || null; } catch (e) { return null; } };
+  /** Laporan singkat isi APK (hanya di aplikasi Android) untuk pesan error; kosong di peramban. */
+  function nativeReport() {
+    try { const b = nativeBridge(); return b && typeof b.tessdataReport === 'function' ? String(b.tessdataReport() || '').slice(0, 400) : ''; } catch (e) { return ''; }
+  }
+  /** Data bahasa (gzip) dalam base64. Tiga jalur, dicoba berurutan:
+   *  1) skrip vendor/tessdata/<bahasa>.b64.js. Berkas .js terbukti selalu bisa dimuat WebView Android, sedangkan .gz pernah 404.
+   *  2) fetch berkas .traineddata.gz / .traineddata (cara biasa di peramban).
+   *  3) jembatan native (membaca langsung dari APK). */
+  const langCache = {};
+  async function langB64(name) {
+    if (langCache[name]) return langCache[name];
+    const why = [];
+    try {
+      const T = root.KH_TESSDATA = root.KH_TESSDATA || {};
+      if (!(T[name] && T[name].length > 1000)) await loadScript(abs('vendor/tessdata/' + name + '.b64.js'));
+      if (T[name] && T[name].length > 1000) return (langCache[name] = T[name]);
+      why.push('skrip kosong');
+    } catch (e) { why.push('skrip: ' + errText(e)); }
+    for (const ext of ['.traineddata.gz', '.traineddata']) {
+      try {
+        const r = await fetch(abs('vendor/tessdata/' + name + ext));
+        if (!r.ok) throw new Error('kode ' + r.status);
+        const buf = await r.arrayBuffer();
+        if (buf.byteLength < 1000) throw new Error('berkas terlalu kecil');
+        return (langCache[name] = b64OfBuffer(buf));
+      } catch (e) { why.push(ext + ': ' + errText(e)); }
+    }
+    try {
+      const b = nativeBridge();
+      const v = b && typeof b.readTessdata === 'function' ? b.readTessdata(name) : null;
+      if (v && v.length > 1000) return (langCache[name] = String(v));
+      why.push('native: tidak ada');
+    } catch (e) { why.push('native: ' + errText(e)); }
+    throw new Error('Gagal memuat data bahasa ' + name + ' (' + why.join('; ') + ')');
+  }
+  /** Apakah berkas .gz bisa diambil lewat alamat biasa (yang dipakai worker Tesseract pada mode standar)? Dicek sekali. */
+  let gzOk = null;
+  async function gzReachable() {
+    if (gzOk !== null) return gzOk;
+    try {
+      const rs = await Promise.all(LANGS.map((n) => withTimeout(fetch(abs('vendor/tessdata/' + n + '.traineddata.gz')), 10000, 'waktu habis')));
+      gzOk = rs.every((r) => r.ok);
+      rs.forEach((r) => { try { r.body && r.body.cancel && r.body.cancel(); } catch (e) { /* tidak penting */ } });
+    } catch (e) { gzOk = false; }
+    return gzOk;
+  }
   async function langWorkerUrl(workerUrl) {
-    const get = async (name) => { const r = await fetch(abs('vendor/tessdata/' + name + '.traineddata.gz')); if (!r.ok) throw new Error('Gagal memuat ' + name + ' (' + r.status + ')'); return b64OfBuffer(await r.arrayBuffer()); };
-    const [eng, ind] = [await get('eng'), await get('ind')];
+    const [eng, ind] = [await langB64('eng'), await langB64('ind')];
     const head = '(function(){var D={eng:"', mid = '",ind:"', tail = '"};var f=self.fetch;self.fetch=function(u,o){var n=String(u).split("?")[0].split("/").pop().toLowerCase(),m=/^([a-z_]+)\\.traineddata(?:\\.gz)?$/.exec(n);if(m&&D[m[1]]){var b=atob(D[m[1]]),a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return Promise.resolve(new Response(a,{status:200}));}return f.apply(self,arguments);};})();\nimportScripts(' + JSON.stringify(workerUrl) + ');';
     return URL.createObjectURL(new Blob([head, eng, mid, ind, tail], { type: 'text/javascript' }));
   }
@@ -93,6 +141,9 @@
           const errs = []; stratIdx = loadStrat();
           for (let k = 0; k < STRATEGIES.length && !worker; k++) {
             const idx = (stratIdx + k) % STRATEGIES.length, st = STRATEGIES[idx];
+            // Mode standar membuat worker mengambil berkas .gz lewat alamat web. Bila alamat itu tidak terbaca (404 di beberapa build/WebView),
+            // jangan buang waktu menyalakan mesin yang pasti gagal: langsung pakai mode yang membawa data bahasa dari memori.
+            if (!st.embed && !(await gzReachable())) { errs.push(st.name + ': dilewati (berkas bahasa .gz tidak terbaca dari APK)'); continue; }
             try {
               if (k > 0 && progressCb) progressCb({ status: 'kompatibilitas', progress: 0 });
               worker = await startEngine(st, logger);
@@ -101,7 +152,8 @@
           }
           if (!worker) {
             const ver = /Chrome\/([\d.]+)/.exec((root.navigator && navigator.userAgent) || '');
-            throw new Error('Mesin baca tidak bisa dijalankan di perangkat ini. Rincian: ' + errs.join(' | ') + (ver ? ' [WebView ' + ver[1] + ']' : ''));
+            const rep = nativeReport();
+            throw new Error('Mesin baca tidak bisa dijalankan di perangkat ini. Rincian: ' + errs.join(' | ') + (rep ? ' | APK: ' + rep : '') + (ver ? ' [WebView ' + ver[1] + ']' : ''));
           }
         }
         return worker;
@@ -435,5 +487,5 @@
   }
 
 
-  root.KHOCR = { reset: resetWorker, readFiles, readFile: (f, s) => readFiles([f], s), selfTest, _workerParts: workerParts, _bytesFromB64: bytesFromB64 };
+  root.KHOCR = { reset: resetWorker, readFiles, readFile: (f, s) => readFiles([f], s), selfTest, _workerParts: workerParts, _bytesFromB64: bytesFromB64, _getWorker: getWorker };
 })(typeof self !== 'undefined' ? self : this);

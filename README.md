@@ -23,8 +23,8 @@ Paket ini mengambil UI dan logika KasHarian v1.0.1 dari PWA yang Anda kirim, lal
    - `KASHARIAN_KEY_ALIAS`
    - `KASHARIAN_KEY_PASSWORD`
 5. Buka tab `Actions`, pilih workflow `Build KasHarian APK`, lalu jalankan `Run workflow` (atau push ke branch `main`).
-6. Setelah status workflow hijau, buka hasil run dan unduh artifact `KasHarian-v1.0.1-release`. Di dalam artifact ada `KasHarian-v1.0.1-release.apk`.
-7. Untuk membuat halaman GitHub Release yang langsung menampilkan APK, buat dan push tag `v1.0.1`. Workflow akan melampirkan APK pada Release tersebut.
+6. Setelah status workflow hijau, buka hasil run dan unduh artifact `KasHarian-v1.0.2-release`. Di dalam artifact ada `KasHarian-v1.0.2-release.apk`.
+7. Untuk membuat halaman GitHub Release yang langsung menampilkan APK, buat dan push tag `v1.0.2`. Workflow akan melampirkan APK pada Release tersebut.
 
 Build memakai GitHub-hosted runner. Anda tidak perlu memasang Android Studio, Android SDK, atau Gradle di HP/komputer Anda. Setelah build berhasil, workflow membuat file `KasHarian-v1.0.1-release.apk`; bila pemicu berupa tag `v1.0.1`, file itu juga dilampirkan ke GitHub Release.
 
@@ -35,8 +35,8 @@ Kunci rilis RSA 4096-bit dibuat untuk proyek ini. Gunakan file kunci yang diberi
 ## Versi dan identitas
 
 - `applicationId`: `id.kasharian.app`
-- `versionCode`: `101`
-- `versionName`: `1.0.1`
+- `versionCode`: `102`
+- `versionName`: `1.0.2`
 - `minSdk`: 26 (Android 8.0)
 - `targetSdk` / `compileSdk`: 36
 

@@ -30,6 +30,25 @@ node - <<'NODE' "$WWW/js/backup.js"
   console.log('JavaScript assets OK; PWA/APK backup channels are isolated and authenticated.');
 })().catch((e) => { console.error(e); process.exitCode = 1; });
 NODE
+# Data bahasa OCR: berkas .gz (dipakai mode standar) dan salinan .b64.js (jalur cadangan yang terbukti bisa dimuat WebView) harus ada dan identik.
+for L in eng ind; do
+  [ -s "$WWW/vendor/tessdata/$L.traineddata.gz" ] || { echo "Data bahasa $L.traineddata.gz tidak ada" >&2; exit 1; }
+  [ -s "$WWW/vendor/tessdata/$L.b64.js" ] || { echo "Data bahasa $L.b64.js tidak ada" >&2; exit 1; }
+done
+node - <<'NODE' "$WWW/vendor/tessdata"
+const fs = require('fs'), path = require('path'), zlib = require('zlib');
+const dir = process.argv[2];
+global.self = global;
+for (const l of ['eng', 'ind']) {
+  const gz = fs.readFileSync(path.join(dir, l + '.traineddata.gz'));
+  zlib.gunzipSync(gz); // harus gzip yang valid
+  delete global.KH_TESSDATA;
+  require(path.join(dir, l + '.b64.js'));
+  const copy = Buffer.from(global.KH_TESSDATA[l], 'base64');
+  if (!copy.equals(gz)) throw new Error('Salinan ' + l + '.b64.js tidak identik dengan ' + l + '.traineddata.gz. Buat ulang salinannya.');
+}
+console.log('Data bahasa OCR OK (.gz dan .b64.js identik).');
+NODE
 # Ensure the app contains the complete local OCR/PDF runtime.
 find "$WWW/vendor" -type f -size +10k | grep -q .
 echo "Asset check lulus."
